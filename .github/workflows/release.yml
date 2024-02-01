@@ -3,9 +3,9 @@ name: Release
 on:
   push:
     branches:
-      - "master"
+      - "main"
     paths:
-      - 'rockspecs/**'
+      - 'rockspec/**'
 
 jobs:
   release:
@@ -51,4 +51,4 @@ jobs:
           LUAROCKS_TOKEN: ${{ secrets.LUAROCKS_TOKEN }}
         run: |
           luarocks install dkjson
-          luarocks upload nginx-lua-prometheus-${{ steps.release_env.outputs.version_withou_v }}-0.rockspec --api-key=${LUAROCKS_TOKEN}
+          luarocks upload rockspec/nginx-lua-prometheus-api7-${{ steps.release_env.outputs.version_withou_v }}-1.rockspec --api-key=${LUAROCKS_TOKEN}
