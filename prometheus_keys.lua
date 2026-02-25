@@ -36,16 +36,13 @@ function KeyIndex:remove_expired_keys()
   for i, _ in pairs(self.expire_keys) do
     -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
     local ttl, err = self.dict:ttl(self.key_prefix .. i)
-    if ttl and ttl >=0 or err and err ~= "not found" then
-      goto CONTINUE
-    else
+    if not (ttl and ttl >= 0 or err and err ~= "not found") then
       if self.keys[i] then
         self.index[self.keys[i]] = nil
         self.keys[i] = nil
       end
       self.expire_keys[i] = nil
     end
-    ::CONTINUE::
   end
 end
 

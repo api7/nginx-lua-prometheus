@@ -25,13 +25,10 @@ jobs:
       - run: echo $PWD/here/bin >> $GITHUB_PATH
       - run: eval `luarocks path --bin`
       - run: luarocks install luacheck
-      - run: luarocks install luacov-coveralls
       - run: luarocks install luaunit
       - run: luarocks install lrexlib-pcre2
       - run: luacheck --globals ngx -- prometheus.lua prometheus_keys.lua prometheus_resty_counter.lua
       - run: luacheck --globals luaunit rex_pcre2 ngx TestPrometheus TestKeyIndex -- prometheus_test.lua
-      - run: lua -lluacov prometheus_test.lua
-      - run: luacov-coveralls --include ^prometheus
         env:
           COVERALLS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Only report test coverage for lua 5.1 to avoid doing it twice.
