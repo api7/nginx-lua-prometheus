@@ -83,6 +83,7 @@ function KeyIndex:sync_range(first, last)
     elseif self.keys[i] then
       self.index[self.keys[i]] = nil
       self.keys[i] = nil
+      self.expire_keys[i] = nil
     end
   end
   self.last = last
