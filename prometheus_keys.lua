@@ -119,10 +119,21 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       local N = self:sync()
       if self.index[key] ~= nil then
         -- key already exists, if has exptime, set expire
+        local expired = false
         if exptime then
-          self.dict:expire(self.key_prefix .. self.index[key], exptime)
+          local ok = self.dict:expire(self.key_prefix .. self.index[key], exptime)
+          -- if key has already expired, remove it from the index
+          if not ok then
+            local idx = self.index[key]
+            self.index[key] = nil
+            self.keys[idx] = nil
+            self.expire_keys[idx] = nil
+            expired = true
+          end
         end
-        break
+        if not expired then
+          break
+        end
       end
       N = N+1
       local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, exptime)
