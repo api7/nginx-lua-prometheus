@@ -145,6 +145,8 @@ function TestPrometheus:setUp()
   self.gauge_exp = self.p:gauge("gauge_exp", "Gauge expire", nil, 1)
   self.gauge_exp_2 = self.p:gauge("gauge_exp_2", "Gauge expire 2", nil, 1)
   self.hist_exp = self.p:histogram("l_exp", "Histogram expire", nil, nil, 1)
+  self.counter_exp_2 = self.p:counter("metric_exp2", "Metric expire 2", nil, 1)
+
 end
 function TestPrometheus.tearDown()
   ngx.logs = nil
@@ -177,6 +179,10 @@ function TestPrometheus:testInitOptions()
   assert(p4.prefix == "foo")
   assert(p4.sync_interval == 3)
   assert(p4.error_metric_name == "foobar")
+  assert(p4.remove_expired_keys_interval ~= 0 and p4.remove_expired_keys_interval ~= "")
+
+  local p5 = require('prometheus').init("metrics", {remove_expired_keys_interval=3})
+  assert(p5.remove_expired_keys_interval == 3)
 
   luaunit.assertEquals(ngx.logs, nil)
 end
@@ -738,7 +744,7 @@ TestKeyIndex = {}
 function TestKeyIndex:setUp()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
-  self.key_index = require('prometheus_keys').new(self.dict, '_prefix_')
+  self.key_index = require('prometheus_keys').new(self.dict, "_prefix_", 1)
 end
 function TestKeyIndex.tearDown()
   ngx.logs = nil
@@ -915,6 +921,7 @@ function TestPrometheus:testKeyTimeout()
 
   self.gauge_exp_2:set(1)
   self.p.key_index:sync()
+  self.p.key_index:remove_expired_keys()
   luaunit.assertEquals(self.dict:get("gauge_exp_2"), 1)
   i = self.p.key_index.index["gauge_exp_2"]
   luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), "gauge_exp_2")
@@ -922,6 +929,7 @@ function TestPrometheus:testKeyTimeout()
 
   sleep(1)
   self.p.key_index:sync()
+  self.p.key_index:remove_expired_keys()
   luaunit.assertEquals(self.dict:get("gauge_exp_2"), nil)
   luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), nil)
   luaunit.assertEquals(self.p.key_index.index["gauge_exp_2"], nil)
@@ -944,6 +952,19 @@ function TestPrometheus:testKeyTimeout()
   luaunit.assertEquals(self.dict:get('l_exp_bucket{le="Inf"}'), nil)
   luaunit.assertEquals(self.dict:get('l_exp_count'), nil)
   luaunit.assertEquals(self.dict:get('l_exp_sum'), nil)
+
+end
+
+function TestPrometheus:testKeyTimeout2()
+  self.counter_exp_2:inc(1)
+  self.p._counter:sync()
+  sleep(2)
+  self.p.key_index:sync()
+  self.p.key_index:remove_expired_keys()
+  self.counter_exp_2:inc(1)
+  self.p._counter:sync()
+  local i = self.p.key_index.index["metric_exp2"]
+  luaunit.assertEquals(self.p.key_index.keys[i], "metric_exp2")
 
 end
 

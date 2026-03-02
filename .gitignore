@@ -1,3 +1,4 @@
 *.src.rock
 *.tar.gz
 nginx-lua-prometheus-0.*/**
+.idea

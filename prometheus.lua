@@ -92,6 +92,9 @@ local DEFAULT_ERROR_METRIC_NAME = "nginx_metric_errors_total"
 -- Default value for per-worker counter sync interval (seconds).
 local DEFAULT_SYNC_INTERVAL = 1
 
+-- Max value for check and remove expired keys interval (seconds).
+local MAX_REMOVE_EXPIRED_KEYS_INTERVAL = 3600
+
 -- Default max size of lookup table
 local DEFAULT_LOOKUP_MAX_SIZE = 1000
 
@@ -412,6 +415,12 @@ local function lookup_or_create(self, label_values)
   local LEAF_KEY = mt -- key used to store full metric names in leaf tables.
   local full_name = t[LEAF_KEY]
   if full_name then
+    if self.exptime and self.exptime > 0 then
+      local err = self._key_index:add(full_name, ERR_MSG_LRU_EVICTION, self.exptime)
+      if err then
+        return nil, err
+      end
+    end
     return full_name
   end
 
@@ -733,15 +742,20 @@ function Prometheus.init(dict_name, options_or_prefix)
       DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = options_or_prefix.lookup_max_size or
       DEFAULT_LOOKUP_MAX_SIZE
+    self.remove_expired_keys_interval = options_or_prefix.remove_expired_keys_interval
+        and options_or_prefix.remove_expired_keys_interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+        and options_or_prefix.remove_expired_keys_interval
+      or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
+    self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
   end
 
   self.registry = {}
-  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX)
+  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX, self.remove_expired_keys_interval)
 
   self.initialized = true
 
