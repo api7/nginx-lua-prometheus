@@ -804,6 +804,44 @@ function TestKeyIndex:testList()
   luaunit.assertEquals(keys[3], "key3")
 end
 
+-- Regression test for apache/apisix#11934 (duplicate metrics).
+-- A key with an exptime is added and synced (self.last now tracks N). The key
+-- then expires in the underlying shared dict without going through remove(), so
+-- neither key_count nor delete_count changes and the next sync() is a no-op,
+-- leaving self.index still pointing at the now-vanished slot. Re-adding the key
+-- therefore takes the "expired" path in add() and allocates a new slot while
+-- the stale slot lingers in self.keys. Before the fix, delete_count was not
+-- bumped (other workers never re-synced) and list() iterated self.keys, so the
+-- same key was emitted twice -> duplicate metrics.
+function TestKeyIndex:testExpiredReAddNoDuplicate()
+  self.key_index:add("expkey", "eviction_err", 1)
+  self.key_index:sync()
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "expkey")
+  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), nil)
+  luaunit.assertEquals(self.key_index.index["expkey"], 1)
+
+  -- Let the key expire in the underlying shared dict. key_count and
+  -- delete_count are untouched, so the next sync() inside add() is a no-op and
+  -- the local index keeps pointing at the (now gone) slot 1.
+  sleep(2)
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), nil)
+
+  -- Re-adding the now-expired key takes the expired branch and allocates slot 2.
+  self.key_index:add("expkey", "eviction_err", 1)
+  luaunit.assertEquals(ngx.logs, nil)
+  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "expkey")
+
+  -- delete_count must have been bumped on the expired re-add path so that
+  -- other workers do a full sync and drop the stale slot.
+  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), 1)
+
+  -- list() must report the key exactly once, not twice.
+  local keys = self.key_index:list()
+  luaunit.assertEquals(#keys, 1)
+  luaunit.assertEquals(keys[1], "expkey")
+end
+
 function TestKeyIndex:testSync()
   self.key_index:sync()
   luaunit.assertEquals(ngx.logs, nil)

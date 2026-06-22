@@ -91,9 +91,18 @@ function KeyIndex:list()
   self:sync()
   local copy = {}
   local i = 1
-  for _, v in pairs(self.keys) do
-    copy[i] = v
-    i = i + 1
+  -- Walk the key slots in order, but only emit a key when the slot is the one
+  -- the index currently points at (self.index[key] == idx). self.keys can
+  -- transiently hold the same key value in two different slots (e.g. when an
+  -- expired metric is re-added at a new slot before the old slot is reclaimed);
+  -- listing the raw self.keys values would emit duplicate metrics. Consulting
+  -- the index guarantees each key is listed exactly once, at its canonical slot.
+  for idx = 0, self.last do
+    local key = self.keys[idx]
+    if key and self.index[key] == idx then
+      copy[i] = key
+      i = i + 1
+    end
   end
   return copy
 end
@@ -125,6 +134,13 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
             self.index[key] = nil
             self.keys[idx] = nil
             self.expire_keys[idx] = nil
+            self.dict:set(self.key_prefix .. idx, nil)
+            self.deleted = self.deleted + 1
+            -- Bump delete_count so other workers do a full sync and reclaim the
+            -- stale slot. Without this the old slot lingers in their local
+            -- self.keys while the metric is re-added at a new slot, which
+            -- desynchronizes the index and causes duplicate metric emission.
+            self.dict:incr(self.delete_count, 1, 0)
             expired = true
           end
         end
