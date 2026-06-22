@@ -814,7 +814,8 @@ end
 -- bumped (other workers never re-synced) and list() iterated self.keys, so the
 -- same key was emitted twice -> duplicate metrics.
 function TestKeyIndex:testExpiredReAddNoDuplicate()
-  self.key_index:add("expkey", "eviction_err", 1)
+  local err = self.key_index:add("expkey", "eviction_err", 1)
+  luaunit.assertEquals(err, nil)
   self.key_index:sync()
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
   luaunit.assertEquals(self.dict:get("_prefix_key_1"), "expkey")
@@ -828,8 +829,8 @@ function TestKeyIndex:testExpiredReAddNoDuplicate()
   luaunit.assertEquals(self.dict:get("_prefix_key_1"), nil)
 
   -- Re-adding the now-expired key takes the expired branch and allocates slot 2.
-  self.key_index:add("expkey", "eviction_err", 1)
-  luaunit.assertEquals(ngx.logs, nil)
+  err = self.key_index:add("expkey", "eviction_err", 1)
+  luaunit.assertEquals(err, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_2"), "expkey")
 
   -- delete_count must have been bumped on the expired re-add path so that
