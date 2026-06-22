@@ -91,15 +91,17 @@ function KeyIndex:list()
   self:sync()
   local copy = {}
   local i = 1
-  -- Walk the key slots in order, but only emit a key when the slot is the one
-  -- the index currently points at (self.index[key] == idx). self.keys can
-  -- transiently hold the same key value in two different slots (e.g. when an
-  -- expired metric is re-added at a new slot before the old slot is reclaimed);
-  -- listing the raw self.keys values would emit duplicate metrics. Consulting
-  -- the index guarantees each key is listed exactly once, at its canonical slot.
-  for idx = 0, self.last do
-    local key = self.keys[idx]
-    if key and self.index[key] == idx then
+  -- Emit a key only from the slot the index currently points at
+  -- (self.index[key] == idx). self.keys can transiently hold the same key value
+  -- in two different slots (e.g. when an expired metric is re-added at a new
+  -- slot before the old slot is reclaimed); listing the raw self.keys values
+  -- would emit duplicate metrics. Consulting the index guarantees each key is
+  -- listed exactly once, at its canonical slot. Iterating self.keys (not
+  -- 0..self.last) keeps this O(live keys): self.last grows monotonically with
+  -- every add and is never reclaimed, so a slot range scan would walk every
+  -- dead slot ever created on long-lived, high-churn workers.
+  for idx, key in pairs(self.keys) do
+    if self.index[key] == idx then
       copy[i] = key
       i = i + 1
     end
@@ -127,21 +129,32 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         -- key already exists, if has exptime, set expire
         local expired = false
         if exptime then
-          local ok = self.dict:expire(self.key_prefix .. self.index[key], exptime)
-          -- if key has already expired, remove it from the index
+          local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
           if not ok then
-            local idx = self.index[key]
-            self.index[key] = nil
-            self.keys[idx] = nil
-            self.expire_keys[idx] = nil
-            self.dict:set(self.key_prefix .. idx, nil)
-            self.deleted = self.deleted + 1
-            -- Bump delete_count so other workers do a full sync and reclaim the
-            -- stale slot. Without this the old slot lingers in their local
-            -- self.keys while the metric is re-added at a new slot, which
-            -- desynchronizes the index and causes duplicate metric emission.
-            self.dict:incr(self.delete_count, 1, 0)
-            expired = true
+            if err == "not found" then
+              -- The slot already expired in the shared dict. Drop the stale
+              -- local state and bump delete_count so other workers do a full
+              -- sync and reclaim the slot; without this the old slot lingers in
+              -- their local self.keys while the metric is re-added at a new slot,
+              -- desynchronizing the index and causing duplicate metric emission.
+              -- The dict slot is already gone (expire returned "not found"), so
+              -- there is no slot to clear here.
+              local idx = self.index[key]
+              self.index[key] = nil
+              self.keys[idx] = nil
+              self.expire_keys[idx] = nil
+              self.deleted = self.deleted + 1
+              local _, incr_err, forcible = self.dict:incr(self.delete_count, 1, 0)
+              if incr_err or forcible then
+                return incr_err or err_msg_lru_eviction
+              end
+              expired = true
+            else
+              -- Unexpected expire error: the slot may still be live, so leave it
+              -- as-is rather than re-adding it, which would create a duplicate.
+              ngx.log(ngx.ERR, "failed to renew expire for key '", key, "': ",
+                      tostring(err))
+            end
           end
         end
         if not expired then

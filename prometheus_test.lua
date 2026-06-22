@@ -58,6 +58,7 @@ function SimpleDict:expire(k, exptime)
     return nil, "not found"
   end
   self.dict[k]["expired"] = os.time() + exptime
+  return true  -- match ngx.shared.DICT:expire, which returns true on success
 end
 function SimpleDict:ttl(k)
   self:get(k)
@@ -822,6 +823,14 @@ function TestKeyIndex:testExpiredReAddNoDuplicate()
   luaunit.assertEquals(self.dict:get("_prefix_delete_count"), nil)
   luaunit.assertEquals(self.key_index.index["expkey"], 1)
 
+  -- A second worker sharing the same shared dict syncs the initial state, so it
+  -- now holds slot 1 in its local self.keys/index. This is the worker that the
+  -- delete_count bump must later force to re-sync and reclaim the stale slot.
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
+  luaunit.assertEquals(worker2.index["expkey"], 1)
+  luaunit.assertEquals(#worker2:list(), 1)
+
   -- Let the key expire in the underlying shared dict. key_count and
   -- delete_count are untouched, so the next sync() inside add() is a no-op and
   -- the local index keeps pointing at the (now gone) slot 1.
@@ -841,6 +850,31 @@ function TestKeyIndex:testExpiredReAddNoDuplicate()
   local keys = self.key_index:list()
   luaunit.assertEquals(#keys, 1)
   luaunit.assertEquals(keys[1], "expkey")
+
+  -- The second worker must converge: its next sync() sees the bumped
+  -- delete_count, does a full sync, drops the stale slot 1 and picks up slot 2.
+  -- Without the delete_count bump it would keep slot 1 forever and list() the
+  -- key twice.
+  worker2:sync()
+  luaunit.assertEquals(worker2.keys[1], nil)
+  luaunit.assertEquals(worker2.index["expkey"], 2)
+  local keys2 = worker2:list()
+  luaunit.assertEquals(#keys2, 1)
+  luaunit.assertEquals(keys2[1], "expkey")
+end
+
+-- list() must de-duplicate when self.keys transiently holds the same key in two
+-- slots (the window before a stale slot is reclaimed): only the slot the index
+-- points at is canonical. This isolates the list() guard from the add() path.
+function TestKeyIndex:testListDeduplicatesStaleSlot()
+  self.key_index.keys = {[1] = "dup", [2] = "dup"}
+  self.key_index.index = {dup = 2}
+  self.key_index.last = 2
+
+  local keys = self.key_index:list()
+  luaunit.assertEquals(ngx.logs, nil)
+  luaunit.assertEquals(#keys, 1)
+  luaunit.assertEquals(keys[1], "dup")
 end
 
 function TestKeyIndex:testSync()
