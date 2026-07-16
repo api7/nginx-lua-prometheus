@@ -7,6 +7,13 @@
 local KeyIndex = {}
 KeyIndex.__index = KeyIndex
 
+-- Upper bound on how far a single add() call may advance key_count while it
+-- repairs a counter that has fallen behind occupied slots (see the comment in
+-- add()). It bounds the worst-case latency of one call; the advanced counter
+-- is shared through the dict, so later calls resume where this one stopped
+-- and the index converges even when far more slots need repairing.
+local MAX_KEY_COUNT_REPAIRS = 1000
+
 
 -- check and remove expired keys
 local function remove_expired_keys(_, self)
@@ -123,6 +130,9 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
   end
 
   for _, key in pairs(keys) do
+    local retried = false
+    local repairs = 0
+    local repair_forcible = false
     while true do
       local N = self:sync()
       if self.index[key] ~= nil then
@@ -158,6 +168,14 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
           end
         end
         if not expired then
+          if repair_forcible then
+            -- the key was adopted from an occupied slot after repair
+            -- increments that forcibly displaced other entries; report the
+            -- eviction just like the new-slot success path does.
+            return (err_msg_lru_eviction .. "; key index: adopted key after " ..
+              "key_count repair: idx=" .. self.key_prefix .. self.index[key] ..
+              ", key=" .. key)
+          end
           break
         end
       end
@@ -170,7 +188,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         if exptime and exptime > 0 then
           self.expire_keys[N] = true
         end
-        if forcible or forcible2 then
+        if forcible or forcible2 or repair_forcible then
           return (err_msg_lru_eviction .. "; key index: add key: idx=" ..
                   self.key_prefix .. N .. ", key=" .. key)
         end
@@ -178,6 +196,43 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       elseif err ~= "exists" then
         return "Unexpected error adding a key: " .. err
       end
+
+      -- "exists": slot N is already occupied although key_count reported N-1.
+      -- Once per key this can be a benign race with another worker that has
+      -- created slot N but not incremented key_count yet, so retry and let
+      -- sync() pick the new slot up. If it repeats, key_count has fallen
+      -- behind the occupied slots: it is an ordinary shared-dict node, so on
+      -- a full dict it can be LRU-evicted (it is only refreshed when new keys
+      -- are registered, so it goes cold under steady traffic) and incr() then
+      -- re-creates it at 1, far below the surviving slots. Retrying the same
+      -- slot forever would spin the worker at 100% CPU with the shared-dict
+      -- lock held hot (apache/apisix#12275). Advance the counter past the
+      -- occupied slot instead: the next sync() adopts that slot's occupant
+      -- and progress resumes.
+      if retried then
+        local _, incr_err, forcible3 = self.dict:incr(self.key_count, 1, 0)
+        if incr_err then
+          -- hard failure (e.g. "no memory"): give up immediately, mirroring
+          -- the add() error path above, instead of burning the repair budget
+          -- on retries that cannot succeed.
+          return "Unexpected error advancing key_count: " .. incr_err
+        end
+        if forcible3 then
+          -- re-creating an evicted key_count displaced another entry; surface
+          -- it through the LRU-eviction warning on the success path, like
+          -- forcible/forcible2.
+          repair_forcible = true
+        end
+        -- The cap counts attempts, not successes: it exists to guarantee the
+        -- loop terminates.
+        repairs = repairs + 1
+        if repairs >= MAX_KEY_COUNT_REPAIRS then
+          return (err_msg_lru_eviction .. "; key index: key_count fell " ..
+            "behind occupied slots; advanced it by " .. repairs ..
+            " without finding a free slot, dropping key: " .. key)
+        end
+      end
+      retried = true
     end
   end
 end
