@@ -7,6 +7,13 @@
 local KeyIndex = {}
 KeyIndex.__index = KeyIndex
 
+-- Upper bound on how far a single add() call may advance key_count while it
+-- repairs a counter that has fallen behind occupied slots (see the comment in
+-- add()). It bounds the worst-case latency of one call; the advanced counter
+-- is shared through the dict, so later calls resume where this one stopped
+-- and the index converges even when far more slots need repairing.
+local MAX_KEY_COUNT_REPAIRS = 1000
+
 
 -- check and remove expired keys
 local function remove_expired_keys(_, self)
@@ -123,6 +130,8 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
   end
 
   for _, key in pairs(keys) do
+    local retried = false
+    local repairs = 0
     while true do
       local N = self:sync()
       if self.index[key] ~= nil then
@@ -178,6 +187,29 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       elseif err ~= "exists" then
         return "Unexpected error adding a key: " .. err
       end
+
+      -- "exists": slot N is already occupied although key_count reported N-1.
+      -- Once per key this can be a benign race with another worker that has
+      -- created slot N but not incremented key_count yet, so retry and let
+      -- sync() pick the new slot up. If it repeats, key_count has fallen
+      -- behind the occupied slots: it is an ordinary shared-dict node, so on
+      -- a full dict it can be LRU-evicted (it is only refreshed when new keys
+      -- are registered, so it goes cold under steady traffic) and incr() then
+      -- re-creates it at 1, far below the surviving slots. Retrying the same
+      -- slot forever would spin the worker at 100% CPU with the shared-dict
+      -- lock held hot (apache/apisix#12275). Advance the counter past the
+      -- occupied slot instead: the next sync() adopts that slot's occupant
+      -- and progress resumes.
+      if retried then
+        self.dict:incr(self.key_count, 1, 0)
+        repairs = repairs + 1
+        if repairs >= MAX_KEY_COUNT_REPAIRS then
+          return (err_msg_lru_eviction .. "; key index: key_count fell " ..
+            "behind occupied slots; advanced it by " .. repairs ..
+            " without finding a free slot, dropping key: " .. key)
+        end
+      end
+      retried = true
     end
   end
 end
