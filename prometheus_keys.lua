@@ -168,6 +168,14 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
           end
         end
         if not expired then
+          if repair_forcible then
+            -- the key was adopted from an occupied slot after repair
+            -- increments that forcibly displaced other entries; report the
+            -- eviction just like the new-slot success path does.
+            return (err_msg_lru_eviction .. "; key index: adopted key after " ..
+              "key_count repair: idx=" .. self.key_prefix .. self.index[key] ..
+              ", key=" .. key)
+          end
           break
         end
       end

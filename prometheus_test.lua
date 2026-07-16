@@ -33,7 +33,8 @@ function SimpleDict:add(k, v, exptime)
 end
 function SimpleDict:incr(k, v, init)
   local forcible = false
-  if k == "willnotfitk" or v == "willnotfitv" then
+  if k == "willnotfitk" or v == "willnotfitv" or
+     (self.forcible_keys and self.forcible_keys[k]) then
     forcible = true
   end
   if not self.dict[k] then self.dict[k] = {value = init} end
@@ -944,6 +945,31 @@ function TestKeyIndex:testKeyCountRepairIsBounded()
   luaunit.assertEquals(err, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_1501"), "newkey")
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1501)
+end
+
+-- If the repair increments forcibly displaced other entries and the requested
+-- key then turns out to already exist (it gets adopted from an occupied slot
+-- during the repair crawl), the eviction must still be reported through the
+-- LRU-eviction error, exactly like the new-slot success path reports
+-- forcible/forcible2.
+function TestKeyIndex:testKeyCountRepairReportsForcibleEviction()
+  for i = 1, 50 do
+    self.key_index:add("key" .. i, "eviction_err")
+  end
+  self.dict:delete("_prefix_key_count")
+  -- re-creating/incrementing key_count now displaces other entries
+  self.dict.forcible_keys = {["_prefix_key_count"] = true}
+
+  -- a worker with an empty local index registers a key that already exists in
+  -- the dict at a slot ahead of the (rewound) counter: the repair crawl adopts
+  -- it and exits through the existing-key break.
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local err = worker2:add("key30", "eviction_err")
+  luaunit.assertStrContains(err,
+    "eviction_err; key index: adopted key after key_count repair: " ..
+    "idx=_prefix_key_30, key=key30")
+  luaunit.assertEquals(worker2.index["key30"], 30)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 30)
 end
 
 function TestKeyIndex:testSync()
