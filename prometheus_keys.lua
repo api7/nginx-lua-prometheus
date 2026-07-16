@@ -132,6 +132,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
   for _, key in pairs(keys) do
     local retried = false
     local repairs = 0
+    local repair_forcible = false
     while true do
       local N = self:sync()
       if self.index[key] ~= nil then
@@ -179,7 +180,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         if exptime and exptime > 0 then
           self.expire_keys[N] = true
         end
-        if forcible or forcible2 then
+        if forcible or forcible2 or repair_forcible then
           return (err_msg_lru_eviction .. "; key index: add key: idx=" ..
                   self.key_prefix .. N .. ", key=" .. key)
         end
@@ -201,7 +202,21 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       -- occupied slot instead: the next sync() adopts that slot's occupant
       -- and progress resumes.
       if retried then
-        self.dict:incr(self.key_count, 1, 0)
+        local _, incr_err, forcible3 = self.dict:incr(self.key_count, 1, 0)
+        if incr_err then
+          -- hard failure (e.g. "no memory"): give up immediately, mirroring
+          -- the add() error path above, instead of burning the repair budget
+          -- on retries that cannot succeed.
+          return "Unexpected error advancing key_count: " .. incr_err
+        end
+        if forcible3 then
+          -- re-creating an evicted key_count displaced another entry; surface
+          -- it through the LRU-eviction warning on the success path, like
+          -- forcible/forcible2.
+          repair_forcible = true
+        end
+        -- The cap counts attempts, not successes: it exists to guarantee the
+        -- loop terminates.
         repairs = repairs + 1
         if repairs >= MAX_KEY_COUNT_REPAIRS then
           return (err_msg_lru_eviction .. "; key index: key_count fell " ..
