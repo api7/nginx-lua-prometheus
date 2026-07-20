@@ -33,6 +33,7 @@ jobs:
           COVERALLS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Only report test coverage for lua 5.1 to avoid doing it twice.
         if: ${{ matrix.lua == '5.2' }}
+      - run: lua prometheus_test.lua
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 10
