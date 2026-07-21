@@ -180,7 +180,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         end
       end
       N = N+1
-      local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, exptime)
+      local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, nil)
       if ok then
         local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
         self.keys[N] = key
