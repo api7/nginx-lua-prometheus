@@ -1,11 +1,11 @@
 -- Note, this file must have version in its name
 -- (see https://github.com/knyar/nginx-lua-prometheus/issues/27)
 package = "nginx-lua-prometheus-api7"
-version = "0.20260716-1"
+version = "1.0.0-1"
 
 source = {
   url = "git+https://github.com/api7/nginx-lua-prometheus.git",
-  tag = "0.20260716",
+  tag = "1.0.0",
 }
 
 description = {

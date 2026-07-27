@@ -1,4 +1,4 @@
-[![Coverage Status](https://coveralls.io/repos/github/knyar/nginx-lua-prometheus/badge.svg?branch=master)](https://coveralls.io/github/knyar/nginx-lua-prometheus?branch=master)
+[![Coverage Status](https://coveralls.io/repos/github/api7/nginx-lua-prometheus/badge.svg?branch=main)](https://coveralls.io/github/api7/nginx-lua-prometheus?branch=main)
 
 # Prometheus metric library for Nginx
 
@@ -19,9 +19,9 @@ The library file - `prometheus.lua` - needs to be available in `LUA_PATH`. If
 this is the only Lua library you use, you can just point `lua_package_path` to
 the directory with this git repo checked out (see example below).
 
-OpenResty users will find this library in [opm](https://opm.openresty.org/package/knyar/nginx-lua-prometheus/). It
+OpenResty users will find this library in [opm](https://opm.openresty.org/package/api7/nginx-lua-prometheus-api7/). It
 is also available via
-[luarocks](https://luarocks.org/modules/knyar/nginx-lua-prometheus).
+[luarocks](https://luarocks.org/modules/membphis/nginx-lua-prometheus-api7).
 
 ## Quick start guide
 

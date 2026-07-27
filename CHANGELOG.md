@@ -1,8 +1,19 @@
 # Changelog
 
 This file only calls out major changes. Please see [the list of Git commits](
-https://github.com/knyar/nginx-lua-prometheus/commits/master) for the full list
+https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
+
+## 1.0.0
+
+Starting with this release, this fork (`nginx-lua-prometheus-api7`) uses
+semantic versioning. Earlier releases used the upstream date-based scheme
+(`0.YYYYMMDD`); as upstream is dormant and this fork is now maintained
+independently, versions no longer track upstream snapshots. Date-based tags
+before `1.0.0` are kept as-is.
+
+- Reclaim expired shared-dict entries in `remove_expired_keys()` so per-worker
+  metric key dictionaries no longer step down until the dict fills up (#18).
 
 ## 0.20230607
 
