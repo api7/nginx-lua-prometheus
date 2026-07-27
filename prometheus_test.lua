@@ -65,13 +65,32 @@ function SimpleDict:expire(k, exptime)
   self.dict[k]["expired"] = os.time() + exptime
   return true  -- match ngx.shared.DICT:expire, which returns true on success
 end
+function SimpleDict:flush_expired(n)
+  -- Mirrors ngx.shared.DICT:flush_expired: scans the whole dict, physically
+  -- removes only the entries that are already expired and returns how many
+  -- were removed. The optional argument caps the number removed, not scanned.
+  if not self.dict then self.dict = {} end
+  local flushed = 0
+  local now = os.time()
+  for k, v in pairs(self.dict) do
+    if v["expired"] and v["expired"] < now then
+      self.dict[k] = nil
+      flushed = flushed + 1
+      if n and n > 0 and flushed >= n then break end
+    end
+  end
+  return flushed
+end
 function SimpleDict:ttl(k)
-  self:get(k)
-  if not self.dict[k] then
+  -- Like ngx.shared.DICT:ttl, an expired entry reads as "not found" but is NOT
+  -- freed here: only flush_expired (or a write reusing the node) reclaims it.
+  -- Do not prune, or the physical-reclamation assertions below become vacuous.
+  local e = self.dict and self.dict[k]
+  if not e or (e["expired"] and e["expired"] < os.time()) then
     return nil, "not found"
   end
-  if self.dict[k]["expired"] then
-    return self.dict[k]["expired"] - os.time()
+  if e["expired"] then
+    return e["expired"] - os.time()
   else
     return 0
   end
@@ -868,6 +887,58 @@ function TestKeyIndex:testExpiredReAddNoDuplicate()
   luaunit.assertEquals(keys2[1], "expkey")
 end
 
+-- remove_expired_keys() must physically reclaim the shared-dict space of
+-- expired entries, not just drop the worker-local references to them.
+-- Logically expired entries keep occupying slab pages, and the passive
+-- per-write expiry scan cannot reach them once a permanent entry sits at the
+-- LRU tail, so without an explicit flush the dict grows without bound under
+-- label churn (apache/apisix#13658).
+function TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict()
+  local err = self.key_index:add("expkey", "eviction_err", 1)
+  luaunit.assertEquals(err, nil)
+  -- A metric value key: lives in the same dict, and KeyIndex never reads it.
+  self.dict:set("expkey", 1, 1)
+  -- A permanent entry, like the error metric or any metric without an exptime.
+  self.dict:set("permanent", 1)
+
+  sleep(2)
+
+  -- Both entries are logically gone but still physically present: every dict
+  -- API reports them as missing while they still hold their slab pages.
+  luaunit.assertEquals(self.dict:ttl("_prefix_key_1"), nil)
+  luaunit.assertNotNil(self.dict.dict["_prefix_key_1"])
+  luaunit.assertNotNil(self.dict.dict["expkey"])
+
+  self.key_index:remove_expired_keys()
+
+  -- Both the index slot and the metric value must be reclaimed in the same
+  -- round. Before the fix remove_expired_keys() issued no dict writes at all,
+  -- so both entries survived and the dict only ever grew.
+  luaunit.assertNil(self.dict.dict["_prefix_key_1"])
+  luaunit.assertNil(self.dict.dict["expkey"])
+  -- Entries that have not expired must be left alone.
+  luaunit.assertNotNil(self.dict.dict["permanent"])
+end
+
+-- The index slots of a churning metric must not accumulate: each round expires
+-- the previous slot, and the reclaim must keep the dict bounded rather than
+-- letting every new series step free space down for good.
+function TestKeyIndex:testExpiredSlotsDoNotAccumulate()
+  for _ = 1, 3 do
+    luaunit.assertEquals(self.key_index:add("churn", "eviction_err", 1), nil)
+    sleep(2)
+    self.key_index:remove_expired_keys()
+  end
+
+  local live = 0
+  for k in pairs(self.dict.dict) do
+    if k:find("_prefix_key_", 1, true) == 1 then live = live + 1 end
+  end
+  -- Slot numbers keep advancing (key_count is monotonic), but at most the most
+  -- recent slot may still be physically present; the earlier ones are gone.
+  luaunit.assertTrue(live <= 1)
+end
+
 -- list() must de-duplicate when self.keys transiently holds the same key in two
 -- slots (the window before a stale slot is reclaimed): only the slot the index
 -- points at is canonical. This isolates the list() guard from the add() path.
@@ -1134,6 +1205,29 @@ function TestPrometheus:testKeyTimeout2()
   local i = self.p.key_index.index["metric_exp2"]
   luaunit.assertEquals(self.p.key_index.keys[i], "metric_exp2")
 
+end
+
+-- Same as TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict, but driven
+-- through the public metric API: once a counter with an exptime goes stale,
+-- neither its value key nor its index slot may keep occupying the shared dict.
+function TestPrometheus:testExpiredMetricIsReclaimedFromDict()
+  self.counter_exp:inc(1)
+  self.p._counter:sync()
+  local i = self.p.key_index.index["metric_exp"]
+  luaunit.assertNotNil(i)
+  luaunit.assertEquals(self.dict:get("metric_exp"), 1)
+
+  sleep(2)
+  -- Expired, so invisible through the dict API, yet still holding its space.
+  luaunit.assertNotNil(self.dict.dict["metric_exp"])
+  luaunit.assertNotNil(self.dict.dict["__ngx_prom__key_" .. i])
+
+  self.p.key_index:remove_expired_keys()
+
+  luaunit.assertNil(self.dict.dict["metric_exp"])
+  luaunit.assertNil(self.dict.dict["__ngx_prom__key_" .. i])
+  -- Metrics registered without an exptime are untouched.
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
 end
 
 os.exit(luaunit.run())
