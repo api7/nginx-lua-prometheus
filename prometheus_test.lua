@@ -123,6 +123,12 @@ Nginx.worker = {}
 function Nginx.worker.id()
   return 'testworker'
 end
+function Nginx.worker.pid()
+  return 1
+end
+function Nginx.worker.exiting()
+  return false
+end
 function Nginx.sleep() end
 Nginx.timer = {}
 function Nginx.timer.every(_, _, _) end
@@ -1041,6 +1047,318 @@ function TestKeyIndex:testKeyCountRepairReportsForcibleEviction()
     "idx=_prefix_key_30, key=key30")
   luaunit.assertEquals(worker2.index["key30"], 30)
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 30)
+end
+
+local function count_nodes(dict, prefix)
+  local n = 0
+  for k in pairs(dict.dict) do
+    if k:find(prefix, 1, true) == 1 then n = n + 1 end
+  end
+  return n
+end
+
+-- Registers one permanent key and `churn` keys expiring after 1 second, and
+-- lowers the compaction threshold below that slot count.
+local function churn_slots(key_index, churn)
+  key_index.compact_min_slots = 10
+  key_index:add("permanent", "eviction_err")
+  for i = 1, churn do
+    key_index:add("churn" .. i, "eviction_err", 1)
+  end
+end
+
+-- Slots are never reused, so without compaction every full sync walks every
+-- slot ever allocated. Once most slots are dead the live keys move to a new
+-- generation and the old one is deleted.
+function TestKeyIndex:testCompactDropsDeadSlots()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("long", "eviction_err", 100)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 32)
+  sleep(2)
+
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(ngx.logs, nil)
+  luaunit.assertEquals(self.dict:get("_prefix_gen"), 1)
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_count"), 2)
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_1"), "permanent")
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_2"), "long")
+  -- expiry carries over: none for permanent keys, the remaining ttl otherwise
+  luaunit.assertEquals(self.dict:ttl("_prefix_1_key_1"), 0)
+  luaunit.assertTrue(self.dict:ttl("_prefix_1_key_2") > 90)
+  -- of generation 0 only its key_count is left, and it expires
+  luaunit.assertEquals(count_nodes(self.dict, "_prefix_key_"), 1)
+  luaunit.assertTrue(self.dict:ttl("_prefix_key_count") > 0)
+  luaunit.assertNil(self.dict:get("_prefix_compact_lock"))
+
+  local keys = self.key_index:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"long", "permanent"})
+  luaunit.assertNil(self.key_index:add("new", "eviction_err"))
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_3"), "new")
+end
+
+function TestKeyIndex:testCompactOnlyWhenMostSlotsAreDead()
+  for i = 1, 20 do
+    self.key_index:add("key" .. i, "eviction_err")
+  end
+  -- below the default slot threshold
+  self.key_index:remove_expired_keys()
+  luaunit.assertNil(self.dict:get("_prefix_gen"))
+
+  -- above the threshold, but all slots are live
+  self.key_index.compact_min_slots = 10
+  self.key_index:remove_expired_keys()
+  luaunit.assertNil(self.dict:get("_prefix_gen"))
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 20)
+end
+
+function TestKeyIndex:testCompactSkipsWhileAnotherWorkerHoldsLock()
+  churn_slots(self.key_index, 30)
+  sleep(2)
+  self.dict:set("_prefix_compact_lock", "other")
+
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertNil(self.dict:get("_prefix_gen"))
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "permanent")
+  luaunit.assertEquals(self.dict:get("_prefix_compact_lock"), "other")
+end
+
+function TestKeyIndex:testOtherWorkersFollowCompaction()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("gone", "eviction_err")
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(#worker2:list(), 32)
+  sleep(2)
+
+  self.key_index:remove_expired_keys()
+
+  local keys = worker2:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"gone", "permanent"})
+  luaunit.assertEquals(worker2.gen, 1)
+
+  -- remove() on a worker that has not synced since the switch must remove the
+  -- key from the new generation, not from the deleted slots it still tracks
+  local worker3 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker3.gen, worker3.last = 0, 32
+  worker3.keys, worker3.index = {[32] = "gone"}, {gone = 32}
+  luaunit.assertNil(worker3:remove("gone"))
+  luaunit.assertEquals(self.key_index:list(), {"permanent"})
+
+  -- a worker started after the switch loads only the new generation
+  local worker4 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(worker4:list(), {"permanent"})
+end
+
+-- Another worker writes its slot before it increments key_count; the copy
+-- stops at key_count, so such a slot must still reach the new generation.
+function TestKeyIndex:testCompactKeepsSlotWrittenPastKeyCount()
+  churn_slots(self.key_index, 30)
+  sleep(2)
+  self.dict:add("_prefix_key_32", "late")
+
+  self.key_index:remove_expired_keys()
+
+  local keys = self.key_index:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"late", "permanent"})
+  luaunit.assertNil(self.dict:get("_prefix_key_32"))
+end
+
+-- A key removed from the old generation after it was copied must not come
+-- back through the copy.
+function TestKeyIndex:testCompactDropsKeyRemovedDuringCopy()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("doomed", "eviction_err")
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
+  sleep(2)
+
+  -- worker2 removes the key once the copy is written, before the switch
+  local set = SimpleDict.set
+  self.dict.set = function(d, k, v, exptime)
+    if k == "_prefix_1_key_count" then
+      d.set = nil
+      worker2:remove("doomed")
+    end
+    return set(d, k, v, exptime)
+  end
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.dict:get("_prefix_gen"), 1)
+  luaunit.assertEquals(self.key_index:list(), {"permanent"})
+  luaunit.assertEquals(worker2:list(), {"permanent"})
+  luaunit.assertNil(self.dict:get("_prefix_1_key_2"))
+end
+
+-- Until the switch, other workers renew keys in the old generation; the copy
+-- must end up with the latest expiry, not the one read while copying.
+function TestKeyIndex:testCompactCarriesRenewalDuringCopy()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("renewed", "eviction_err", 5)
+  sleep(2)
+
+  local set = SimpleDict.set
+  self.dict.set = function(d, k, v, exptime)
+    if k == "_prefix_1_key_count" then
+      d.set = nil
+      d:expire("_prefix_key_32", 100)
+    end
+    return set(d, k, v, exptime)
+  end
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.dict:get("_prefix_gen"), 1)
+  local slot = "_prefix_1_key_" .. self.key_index.index["renewed"]
+  luaunit.assertEquals(self.dict:get(slot), "renewed")
+  luaunit.assertTrue(self.dict:ttl(slot) > 90)
+end
+
+-- A slot written into the old generation after the switch would be deleted
+-- with it, so add() registers the key again in the current generation.
+function TestKeyIndex:testAddReRegistersKeyAfterGenerationSwitch()
+  local incr = SimpleDict.incr
+  self.dict.incr = function(d, k, v, init)
+    if k == "_prefix_key_count" then
+      d.incr = nil
+      d:set("_prefix_gen", 1)
+    end
+    return incr(d, k, v, init)
+  end
+
+  luaunit.assertNil(self.key_index:add("key", "eviction_err"))
+
+  luaunit.assertNil(self.dict:get("_prefix_key_1"))
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_1"), "key")
+  luaunit.assertEquals(self.key_index.gen, 1)
+  luaunit.assertEquals(self.key_index:list(), {"key"})
+end
+
+-- A compaction that stopped before switching leaves slots of the next
+-- generation behind; they must not leak into the next attempt.
+function TestKeyIndex:testCompactClearsLeftoverGeneration()
+  churn_slots(self.key_index, 30)
+  sleep(2)
+  self.dict:set("_prefix_1_key_1", "stale1")
+  self.dict:set("_prefix_1_key_2", "stale2")
+
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_count"), 1)
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_1"), "permanent")
+  luaunit.assertNil(self.dict:get("_prefix_1_key_2"))
+  luaunit.assertEquals(self.key_index:list(), {"permanent"})
+end
+
+-- The generation only grows; if its node is evicted from a full dict, a
+-- worker that knows the current generation writes it back.
+function TestKeyIndex:testSyncRestoresEvictedGeneration()
+  churn_slots(self.key_index, 30)
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  self.dict:delete("_prefix_gen")
+
+  self.key_index:sync()
+
+  luaunit.assertEquals(self.dict:get("_prefix_gen"), 1)
+  luaunit.assertEquals(self.key_index:list(), {"permanent"})
+end
+
+function TestPrometheus:testCompactionKeepsMetricData()
+  self.p.key_index.compact_min_slots = 10
+  local keep = self.p:counter("keep_total", "Kept", {"id"})
+  local churn = self.p:counter("churn_total", "Churned", {"id"}, 1)
+  keep:inc(5, {"a"})
+  for i = 1, 30 do
+    churn:inc(1, {tostring(i)})
+  end
+  self.p._counter:sync()
+  local expected = {}
+  for _, line in ipairs(self.p:metric_data()) do
+    if not line:find("churn_total", 1, true) then
+      table.insert(expected, line)
+    end
+  end
+  sleep(2)
+
+  self.p.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.dict:get("__ngx_prom__gen"), 1)
+  luaunit.assertEquals(self.p:metric_data(), expected)
+  keep:inc(1, {"b"})
+  self.p._counter:sync()
+  luaunit.assertEquals(self.dict:get('keep_total{id="b"}'), 1)
+  luaunit.assertNotNil(self.p.key_index.index['keep_total{id="b"}'])
+end
+
+-- Timers still pending when a worker exits run once with premature = true;
+-- that run must not start a compaction.
+function TestKeyIndex:testPrematureTimerDoesNotCompact()
+  local every = ngx.timer.every
+  local callback
+  ngx.timer.every = function(_, cb, _) callback = cb end
+  local key_index = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  ngx.timer.every = every
+  churn_slots(key_index, 30)
+  sleep(2)
+
+  callback(true, key_index)
+  luaunit.assertNil(self.dict:get("_prefix_gen"))
+
+  callback(false, key_index)
+  luaunit.assertEquals(self.dict:get("_prefix_gen"), 1)
+end
+
+function TestKeyIndex:testExitingWorkerDoesNotStartCompaction()
+  churn_slots(self.key_index, 30)
+  sleep(2)
+
+  local written = {}
+  local set = SimpleDict.set
+  self.dict.set = function(d, k, v, exptime)
+    written[#written + 1] = k
+    return set(d, k, v, exptime)
+  end
+  local exiting = ngx.worker.exiting
+  ngx.worker.exiting = function() return true end
+  local ok, err = pcall(self.key_index.remove_expired_keys, self.key_index)
+  ngx.worker.exiting = exiting
+  self.dict.set = nil
+  luaunit.assertTrue(ok, err)
+
+  -- nothing was copied, not merely rolled back
+  luaunit.assertEquals(written, {})
+  luaunit.assertNil(self.dict:get("_prefix_gen"))
+  luaunit.assertNil(self.dict:get("_prefix_compact_lock"))
+end
+
+-- A worker told to exit while copying resumes from its sleep timer and gives
+-- up before switching generations, releasing the lock and its copy.
+function TestKeyIndex:testWorkerExitingDuringCopyAbortsCompaction()
+  churn_slots(self.key_index, 30)
+  sleep(2)
+
+  local get_phase, ngx_sleep, exiting = ngx.get_phase, ngx.sleep, ngx.worker.exiting
+  local exiting_now, sleeps = false, {}
+  ngx.get_phase = function() return "timer" end
+  ngx.sleep = function(s)
+    table.insert(sleeps, s)
+    exiting_now = true
+  end
+  ngx.worker.exiting = function() return exiting_now end
+  local ok, err = pcall(self.key_index.remove_expired_keys, self.key_index)
+  ngx.get_phase, ngx.sleep, ngx.worker.exiting = get_phase, ngx_sleep, exiting
+  luaunit.assertTrue(ok, err)
+
+  luaunit.assertEquals(sleeps, {0.001})
+  luaunit.assertNil(self.dict:get("_prefix_gen"))
+  luaunit.assertNil(self.dict:get("_prefix_compact_lock"))
+  luaunit.assertNil(self.dict:get("_prefix_1_key_1"))
+  luaunit.assertNil(self.dict:get("_prefix_1_key_count"))
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "permanent")
+  luaunit.assertEquals(self.key_index:list(), {"permanent"})
 end
 
 function TestKeyIndex:testSync()
