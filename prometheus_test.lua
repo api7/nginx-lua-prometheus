@@ -1274,6 +1274,80 @@ function TestKeyIndex:testCompactKeepsRenewalAfterOldSlotExpired()
   luaunit.assertEquals(keys, {"permanent", "renewed"})
 end
 
+-- A worker that synced before the switch may renew the old slot after the
+-- copy was reconciled and before the old slots are deleted; the renewal must
+-- reach the new slot.
+function TestKeyIndex:testAddRenewsNewSlotWhenSwitchFollowsSync()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("renewed", "eviction_err", 5)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  sleep(2)
+
+  self.key_index.delete_slots = function() end
+  self.dict.expire = function(d, k, exptime)
+    if k == "_prefix_key_32" then
+      d.expire = nil
+      self.key_index:remove_expired_keys()
+      luaunit.assertEquals(d:get("_prefix_gen"), 1)
+    end
+    return SimpleDict.expire(d, k, exptime)
+  end
+  luaunit.assertNil(worker2:add("renewed", "eviction_err", 100))
+
+  luaunit.assertEquals(worker2.gen, 1)
+  local slot = "_prefix_1_key_" .. self.key_index.index["renewed"]
+  luaunit.assertEquals(self.dict:get(slot), "renewed")
+  luaunit.assertTrue(self.dict:ttl(slot) > 90)
+end
+
+-- A generation evicted from a full dict that cannot be written back is not a
+-- generation switch; add() must not loop on it.
+function TestKeyIndex:testAddDoesNotLoopOnEvictedGeneration()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("renewed", "eviction_err", 100)
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(self.dict:get("_prefix_gen"), 1)
+
+  local calls = 0
+  local set = SimpleDict.set
+  self.dict.set = function(d, k, v, exptime)
+    if k == "_prefix_gen" then
+      calls = calls + 1
+      luaunit.assertTrue(calls < 10, "add() keeps looping")
+      return false, "no memory", false
+    end
+    return set(d, k, v, exptime)
+  end
+  self.dict:delete("_prefix_gen")
+
+  luaunit.assertNil(self.key_index:add("renewed", "eviction_err", 100))
+  luaunit.assertNil(self.key_index:add("new", "eviction_err", 100))
+
+  luaunit.assertEquals(self.key_index.gen, 1)
+  luaunit.assertEquals(self.dict:get("_prefix_1_key_3"), "new")
+  local keys = self.key_index:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"new", "permanent", "renewed"})
+end
+
+-- Generations that keep switching under add() must not keep it looping.
+function TestKeyIndex:testAddGivesUpAfterRepeatedGenerationSwitches()
+  self.dict.add = function(d, k, v, exptime)
+    local ok, err, forcible = SimpleDict.add(d, k, v, exptime)
+    if ok and k:match("key_%d+$") then
+      d:incr("_prefix_gen", 1, 0)
+    end
+    return ok, err, forcible
+  end
+
+  local err = self.key_index:add("key", "eviction_err")
+
+  luaunit.assertStrContains(err, "generation switched 4 times")
+  self.dict.add = nil
+  luaunit.assertEquals(self.key_index:list(), {})
+end
+
 -- A key removed from the new generation after the switch must not come back
 -- from its old slot.
 function TestKeyIndex:testCompactDropsKeyRemovedAfterSwitch()

@@ -14,6 +14,10 @@ KeyIndex.__index = KeyIndex
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
 
+-- Upper bound on how many generation switches a single add() call follows
+-- for one key before it gives up on that key.
+local MAX_GENERATION_RETRIES = 3
+
 -- Slots are never reused: every key that expires or is removed leaves a dead
 -- slot behind, and every full sync (a worker starting, or any delete) walks
 -- all of them. Once key_count reaches COMPACT_MIN_SLOTS and is at least
@@ -212,7 +216,12 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     local repairs = 0
     local repair_forcible = false
     local slot_forcible = false
+    local switches = 0
     while true do
+      if switches > MAX_GENERATION_RETRIES then
+        return ("key index: generation switched " .. switches ..
+          " times while adding key, dropping key: " .. key)
+      end
       local N = self:sync()
       if self.index[key] ~= nil then
         -- key already exists, if has exptime, set expire
@@ -247,6 +256,15 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
           end
         end
         if not expired then
+          if exptime and (self.dict:get(self.gen_key) or 0) > self.gen then
+            -- A compaction switched generations after this worker synced and
+            -- may have reconciled the copy before this renewal of the old
+            -- slot, so renew the key again in the current generation. A lower
+            -- generation only means its node was evicted (see sync()).
+            switches = switches + 1
+            retried = false
+            goto continue
+          end
           if repair_forcible then
             -- the key was adopted from an occupied slot after repair
             -- increments that forcibly displaced other entries; report the
@@ -264,7 +282,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       if ok then
         local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
         slot_forcible = slot_forcible or forcible or forcible2
-        if (self.dict:get(self.gen_key) or 0) == self.gen then
+        if (self.dict:get(self.gen_key) or 0) <= self.gen then
           self.keys[N] = key
           self.index[key] = N
           if exptime and exptime > 0 then
@@ -280,6 +298,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         -- slot may land in the generation being dropped after its keys were
         -- copied. Delete it and register the key in the current generation.
         self.dict:delete(slot)
+        switches = switches + 1
       elseif err ~= "exists" then
         return "Unexpected error adding a key: " .. err
       end
@@ -322,6 +341,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       -- after a generation switch the slots start over, so an earlier
       -- "exists" in the old generation says nothing about the new one
       retried = not ok
+      ::continue::
     end
   end
 end
