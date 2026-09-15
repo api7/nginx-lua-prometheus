@@ -180,6 +180,11 @@ function TestPrometheus:testInit()
   luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
   luaunit.assertEquals(ngx.logs, nil)
 end
+function TestPrometheus:testInitKeepsErrorCount()
+  self.dict:set("nginx_metric_errors_total", 3)
+  require('prometheus').init('metrics')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 3)
+end
 function TestPrometheus:testInitOptions()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
