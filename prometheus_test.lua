@@ -1216,6 +1216,82 @@ function TestKeyIndex:testCompactCarriesRenewalDuringCopy()
   luaunit.assertTrue(self.dict:ttl(slot) > 90)
 end
 
+-- Runs `after_switch` right after the compaction switches to generation 1,
+-- before it reconciles the copy with the old generation.
+local function on_generation_switch(dict, after_switch)
+  local set = SimpleDict.set
+  dict.set = function(d, k, v, exptime)
+    local ok, err, forcible = set(d, k, v, exptime)
+    if k == "_prefix_gen" then
+      d.set = nil
+      after_switch()
+    end
+    return ok, err, forcible
+  end
+end
+
+-- After the switch, other workers renew keys in the new generation; the
+-- expiry left in the old one must not shorten them.
+function TestKeyIndex:testCompactKeepsRenewalAfterSwitch()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("renewed", "eviction_err", 5)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  sleep(2)
+
+  on_generation_switch(self.dict, function()
+    luaunit.assertNil(worker2:add("renewed", "eviction_err", 100))
+  end)
+  self.key_index:remove_expired_keys()
+
+  local slot = "_prefix_1_key_" .. self.key_index.index["renewed"]
+  luaunit.assertEquals(self.dict:get(slot), "renewed")
+  luaunit.assertTrue(self.dict:ttl(slot) > 90)
+end
+
+-- The old slot of a key renewed after the switch may expire before the copy is
+-- reconciled; the renewed slot must survive.
+function TestKeyIndex:testCompactKeepsRenewalAfterOldSlotExpired()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("renewed", "eviction_err", 5)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  sleep(2)
+
+  on_generation_switch(self.dict, function()
+    luaunit.assertNil(worker2:add("renewed", "eviction_err", 100))
+    self.dict:delete("_prefix_key_32")
+  end)
+  self.key_index:remove_expired_keys()
+
+  local slot = "_prefix_1_key_" .. self.key_index.index["renewed"]
+  luaunit.assertEquals(self.dict:get(slot), "renewed")
+  luaunit.assertTrue(self.dict:ttl(slot) > 90)
+  local keys = worker2:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"permanent", "renewed"})
+  local worker3 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  keys = worker3:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"permanent", "renewed"})
+end
+
+-- A key removed from the new generation after the switch must not come back
+-- from its old slot.
+function TestKeyIndex:testCompactDropsKeyRemovedAfterSwitch()
+  churn_slots(self.key_index, 30)
+  self.key_index:add("doomed", "eviction_err", 100)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  sleep(2)
+
+  on_generation_switch(self.dict, function()
+    luaunit.assertNil(worker2:remove("doomed"))
+  end)
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.key_index:list(), {"permanent"})
+  luaunit.assertEquals(worker2:list(), {"permanent"})
+  luaunit.assertNil(self.dict:get("_prefix_1_key_2"))
+end
+
 -- A slot written into the old generation after the switch would be deleted
 -- with it, so add() registers the key again in the current generation.
 function TestKeyIndex:testAddReRegistersKeyAfterGenerationSwitch()

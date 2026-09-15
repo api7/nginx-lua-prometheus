@@ -434,7 +434,7 @@ function KeyIndex:compact()
   local to_prefix, to_count = generation_names(self.prefix, to_gen)
   self:clear_generation(to_gen)
 
-  local keys, index, expire_keys, origin = {}, {}, {}, {}
+  local keys, index, expire_keys, origin, copied_ttl = {}, {}, {}, {}, {}
   local M = 0
   local function abort(msg)
     self:delete_slots(to_prefix, 1, M)
@@ -456,7 +456,7 @@ function KeyIndex:compact()
       if not ok or forcible then
         return abort(err or "copying a slot evicted other entries")
       end
-      keys[M], index[key], origin[M] = key, M, i
+      keys[M], index[key], origin[M], copied_ttl[M] = key, M, i, ttl
       if exptime then
         expire_keys[M] = true
       end
@@ -485,20 +485,29 @@ function KeyIndex:compact()
   self:use_generation(to_gen)
   self.keys, self.index, self.expire_keys, self.last = keys, index, expire_keys, M
 
-  -- Until they switched, other workers renewed and removed keys in the old
-  -- generation: carry over the latest expiry, and drop copies of keys that
-  -- their old slot no longer holds.
+  -- Workers renew and remove keys in the old generation until they switch,
+  -- and in the new one afterwards. A ttl above the one read while copying
+  -- (0 for permanent keys) means the slot was renewed: keep the key while
+  -- either slot holds it unrenewed or renewed, never shorten the new slot,
+  -- and drop keys whose unrenewed slot is gone from either generation.
   local dropped = false
   for j, i in pairs(origin) do
-    local key = keys[j]
+    local key, copied = keys[j], copied_ttl[j]
     local old_slot, new_slot = from_prefix .. i, to_prefix .. j
-    if self.dict:get(old_slot) == key then
-      local ttl = self.dict:ttl(old_slot)
-      if ttl and ttl > 0 and not self.dict:expire(new_slot, ttl) then
-        self.dict:add(new_slot, key, ttl)
+    local old_ttl = self.dict:get(old_slot) == key and self.dict:ttl(old_slot)
+    local new_ttl = self.dict:get(new_slot) == key and self.dict:ttl(new_slot)
+    local old_renewed = old_ttl and old_ttl > copied
+    local keep
+    if new_ttl then
+      keep = old_ttl or new_ttl > copied
+      if old_renewed and new_ttl > 0 and new_ttl < old_ttl then
+        self.dict:expire(new_slot, old_ttl)
       end
-    else
-      if self.dict:get(new_slot) == key then
+    elseif old_renewed then
+      keep = self.dict:add(new_slot, key, old_ttl)
+    end
+    if not keep then
+      if new_ttl then
         self.dict:delete(new_slot)
       end
       if self.index[key] == j then
