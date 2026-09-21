@@ -156,22 +156,38 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
           local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
           if not ok then
             if err == "not found" then
-              -- The slot already expired in the shared dict. Drop the stale
-              -- local state and bump delete_count so other workers do a full
-              -- sync and reclaim the slot; without this the old slot lingers in
-              -- their local self.keys while the metric is re-added at a new slot,
-              -- desynchronizing the index and causing duplicate metric emission.
-              -- The dict slot is already gone (expire returned "not found"), so
-              -- there is no slot to clear here.
+              -- The slot was reclaimed from the shared dict (expire() only
+              -- reports "not found" once the node is physically gone; a merely
+              -- ttl-expired node is resurrected by expire() and keeps its slot).
+              -- Re-claim the SAME slot number rather than allocating a new one.
+              -- The key keeps its identity, so no peer's index[key] goes stale,
+              -- key_count does not grow, and a key can never occupy two slots --
+              -- which is what produced the duplicate metrics this branch was
+              -- written for. Nothing has to be broadcast either, so delete_count
+              -- stays put and no worker is forced into a sync_range(0, key_count)
+              -- on its request path.
               local idx = self.index[key]
+              local ok2, err2, forcible2 =
+                self.dict:add(self.key_prefix .. idx, key, exptime)
+              if ok2 or (err2 == "exists"
+                         and self.dict:get(self.key_prefix .. idx) == key) then
+                -- either we re-claimed it, or a peer re-claimed it for us
+                if exptime and exptime > 0 then
+                  self.expire_keys[idx] = true
+                end
+                if forcible2 then
+                  return (err_msg_lru_eviction .. "; key index: re-claimed slot: idx="
+                          .. self.key_prefix .. idx .. ", key=" .. key)
+                end
+                break
+              end
+              -- The slot could not be re-claimed (out of memory, or it now holds
+              -- a different key because key_count was evicted and restarted).
+              -- Fall back to allocating a new slot below; list() still reports
+              -- the key once, from the slot index currently points at.
               self.index[key] = nil
               self.keys[idx] = nil
               self.expire_keys[idx] = nil
-              self.deleted = self.deleted + 1
-              local _, incr_err, forcible = self.dict:incr(self.delete_count, 1, 0)
-              if incr_err or forcible then
-                return incr_err or err_msg_lru_eviction
-              end
               expired = true
             else
               -- Unexpected expire error: the slot may still be live, so leave it

@@ -848,8 +848,8 @@ function TestKeyIndex:testExpiredReAddNoDuplicate()
   luaunit.assertEquals(self.key_index.index["expkey"], 1)
 
   -- A second worker sharing the same shared dict syncs the initial state, so it
-  -- now holds slot 1 in its local self.keys/index. This is the worker that the
-  -- delete_count bump must later force to re-sync and reclaim the stale slot.
+  -- now holds slot 1 in its local self.keys/index. It must stay correct across
+  -- the re-add without having to be told anything.
   local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
   worker2:sync()
   luaunit.assertEquals(worker2.index["expkey"], 1)
@@ -861,30 +861,85 @@ function TestKeyIndex:testExpiredReAddNoDuplicate()
   sleep(2)
   luaunit.assertEquals(self.dict:get("_prefix_key_1"), nil)
 
-  -- Re-adding the now-expired key takes the expired branch and allocates slot 2.
+  -- Re-adding the now-expired key re-claims slot 1 in place.
   err = self.key_index:add("expkey", "eviction_err", 1)
   luaunit.assertEquals(err, nil)
-  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "expkey")
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "expkey")
+  luaunit.assertEquals(self.key_index.index["expkey"], 1)
 
-  -- delete_count must have been bumped on the expired re-add path so that
-  -- other workers do a full sync and drop the stale slot.
-  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), 1)
+  -- No new slot was allocated, so key_count does not grow ...
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
+  -- ... and nothing has to be broadcast, so no worker is forced into a full
+  -- sync_range(0, key_count) on its request path.
+  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), nil)
 
   -- list() must report the key exactly once, not twice.
   local keys = self.key_index:list()
   luaunit.assertEquals(#keys, 1)
   luaunit.assertEquals(keys[1], "expkey")
 
-  -- The second worker must converge: its next sync() sees the bumped
-  -- delete_count, does a full sync, drops the stale slot 1 and picks up slot 2.
-  -- Without the delete_count bump it would keep slot 1 forever and list() the
-  -- key twice.
-  worker2:sync()
-  luaunit.assertEquals(worker2.keys[1], nil)
-  luaunit.assertEquals(worker2.index["expkey"], 2)
+  -- The second worker never went stale: the key kept its slot number, so its
+  -- local index is still correct and list() reports the key once, with or
+  -- without an intervening sync().
   local keys2 = worker2:list()
   luaunit.assertEquals(#keys2, 1)
   luaunit.assertEquals(keys2[1], "expkey")
+  worker2:sync()
+  luaunit.assertEquals(worker2.index["expkey"], 1)
+  luaunit.assertEquals(#worker2:list(), 1)
+end
+
+
+-- A key whose slot cannot be re-claimed must still be listed exactly once.
+-- The slot is stolen between expire() reporting it gone and add() trying to
+-- re-claim it, which is the only way another key can end up on that slot
+-- number; add() must then fall back to allocating a new one.
+function TestKeyIndex:testExpiredReAddFallbackNoDuplicate()
+  local err = self.key_index:add("expkey", "eviction_err", 1)
+  luaunit.assertEquals(err, nil)
+  self.key_index:sync()
+  luaunit.assertEquals(self.key_index.index["expkey"], 1)
+
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
+  luaunit.assertEquals(worker2.index["expkey"], 1)
+
+  sleep(2)
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), nil)
+
+  -- Simulate a peer writing a different key onto slot 1 in the window between
+  -- our expire() and our add().
+  local real_expire = self.dict.expire
+  self.dict.expire = function(dict_self, k, exptime)
+    local ok, expire_err = real_expire(dict_self, k, exptime)
+    if not ok and k == "_prefix_key_1" then
+      dict_self:set(k, "someone_else")
+    end
+    return ok, expire_err
+  end
+
+  err = self.key_index:add("expkey", "eviction_err", 1)
+  self.dict.expire = real_expire
+
+  luaunit.assertEquals(err, nil)
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "someone_else")
+  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "expkey")
+  luaunit.assertEquals(self.key_index.index["expkey"], 2)
+
+  local seen = 0
+  for _, k in ipairs(self.key_index:list()) do
+    if k == "expkey" then seen = seen + 1 end
+  end
+  luaunit.assertEquals(seen, 1)
+
+  -- worker2 still points at slot 1; list() must not emit the key from a slot
+  -- the index no longer points at.
+  worker2:sync()
+  local seen2 = 0
+  for _, k in ipairs(worker2:list()) do
+    if k == "expkey" then seen2 = seen2 + 1 end
+  end
+  luaunit.assertEquals(seen2, 1)
 end
 
 -- remove_expired_keys() must physically reclaim the shared-dict space of
