@@ -112,6 +112,13 @@ section of nginx configuration.
     RAM, you might want to increase this to avoid cache getting flushed too
     often. Decreasing this makes sense if you have a very large number of
     metrics or need to minimize memory usage of this library.
+  * `remove_expired_keys_interval` (number): how often, in seconds, each worker
+    drops the metrics that have expired and reclaims the shared dict entries
+    they left behind. Defaults to 3600, which is also the maximum.
+  * `auto_flush_expired` (boolean): whether that reclamation also happens on
+    the interval above, in every worker. Defaults to true. Set it to false to
+    schedule [`prometheus:flush_expired()`](#prometheusflush_expired) yourself,
+    for instance from a single process.
 
 Returns a `prometheus` object that should be used to register metrics.
 
@@ -235,6 +242,28 @@ location /metrics {
 **syntax:** prometheus:metric_data()
 
 Returns metric data as an array of strings.
+
+### prometheus:flush_expired()
+
+**syntax:** prometheus:flush_expired()
+
+Reclaims the shared dict entries left behind by metrics that have expired, and
+returns how many were reclaimed.
+
+Expired entries are only logically gone: every shared dict API reports them as
+missing, but they keep holding their memory until something reclaims them. The
+passive reclamation nginx performs on writes cannot do it, because it stops at
+the first entry that has not expired, and a metric registered without an
+`exptime` inevitably ends up sitting there.
+
+This is done for you on `remove_expired_keys_interval`, in every worker, unless
+`auto_flush_expired` is set to false. Call this instead if you would rather
+reclaim from a single process, or on your own schedule.
+
+The reclamation is issued in batches, because the underlying
+`ngx.shared.DICT:flush_expired()` holds the dict lock until it returns: a
+bounded number of entries is reclaimed per call, and the other workers get the
+lock back in between.
 
 ### counter:inc()
 
