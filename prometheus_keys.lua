@@ -14,6 +14,20 @@ KeyIndex.__index = KeyIndex
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
 
+-- Entries a single flush_expired() call may reclaim. That call holds the shared
+-- dict lock until it returns, so this is what bounds how long the other workers
+-- can be kept waiting on the lock: measured at ~1ms per 10000 entries reclaimed
+-- on OpenResty 1.29.2.4.
+local FLUSH_EXPIRED_BATCH = 10000
+
+-- Upper bound on the batches one call may run, so a large backlog is drained
+-- over several ticks instead of in a single long stretch. What is left over is
+-- picked up by the next tick.
+local FLUSH_EXPIRED_MAX_BATCHES = 30
+
+-- Pause between batches, so the lock is not taken back to back.
+local FLUSH_EXPIRED_BATCH_DELAY = 1
+
 
 -- check and remove expired keys
 local function remove_expired_keys(_, self)
@@ -21,9 +35,11 @@ local function remove_expired_keys(_, self)
 end
 
 
-function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
+function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
+                      auto_flush_expired)
   local self = setmetatable({}, KeyIndex)
   self.dict = shared_dict
+  self.auto_flush_expired = auto_flush_expired ~= false
   self.key_prefix = prefix .. "key_"
   self.delete_count = prefix .. "delete_count"
   self.key_count = prefix .. "key_count"
@@ -52,19 +68,50 @@ function KeyIndex:remove_expired_keys()
     end
   end
 
-  -- The loop above only drops worker-local references. The expired shared-dict
-  -- entries themselves (both the __ngx_prom__key_N index slots and the metric
-  -- value keys, which live in the same dict) are only *logically* dead: every
-  -- dict API treats them as missing, but their slab pages stay allocated. The
-  -- passive per-write expiry scan cannot reclaim them either, because it stops
-  -- at the first non-expired entry at the LRU tail, and a permanent entry (the
-  -- error metric, or any metric registered without an exptime) inevitably ends
-  -- up sitting there. Without this call the dict grows without bound under
-  -- label churn: index slots are never reused, so free_space steps down on
-  -- every new series and never recovers (apache/apisix#13658). Since expired
-  -- entries are indistinguishable from absent ones through every dict API,
-  -- reclaiming them here cannot change any observable behaviour.
-  self.dict:flush_expired()
+  -- The loop above only drops worker-local references, so the expired entries
+  -- still have to be reclaimed from the dict itself. Callers that schedule
+  -- flush_expired() themselves -- in a single process rather than in every
+  -- worker -- turn this off with auto_flush_expired.
+  if self.auto_flush_expired then
+    self:flush_expired()
+  end
+end
+
+
+-- Reclaims the expired entries of the shared dict, in batches.
+--
+-- The expired entries (both the __ngx_prom__key_N index slots and the metric
+-- value keys, which live in the same dict) are only *logically* dead: every
+-- dict API treats them as missing, but their slab pages stay allocated. The
+-- passive per-write expiry scan cannot reclaim them either, because it stops
+-- at the first non-expired entry at the LRU tail, and a permanent entry (the
+-- error metric, or any metric registered without an exptime) inevitably ends
+-- up sitting there. Without this the dict grows without bound under label
+-- churn: index slots are never reused, so free_space steps down on every new
+-- series and never recovers (apache/apisix#13658). Since expired entries are
+-- indistinguishable from absent ones through every dict API, reclaiming them
+-- cannot change any observable behaviour.
+--
+-- flush_expired() holds the dict lock for its whole scan of the LRU queue, so
+-- it is called with a batch size: a bounded number of entries is reclaimed per
+-- call, and the workers get the lock back in between.
+--
+-- Returns the number of entries reclaimed.
+function KeyIndex:flush_expired()
+  local total = 0
+  for _ = 1, FLUSH_EXPIRED_MAX_BATCHES do
+    local freed = self.dict:flush_expired(FLUSH_EXPIRED_BATCH)
+    total = total + freed
+    -- freeing less than a full batch means this call has already walked the
+    -- whole queue, so there is nothing left to reclaim
+    if freed < FLUSH_EXPIRED_BATCH then
+      break
+    end
+
+    ngx.sleep(FLUSH_EXPIRED_BATCH_DELAY)
+  end
+
+  return total
 end
 
 -- Loads new keys that might have been added by other workers since last sync.

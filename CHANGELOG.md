@@ -4,6 +4,13 @@ This file only calls out major changes. Please see [the list of Git commits](
 https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
 
+## Unreleased
+
+- Reclaim expired shared-dict entries in batches, so no single
+  `flush_expired()` call holds the dict lock for a whole backlog, and let
+  callers take the reclamation over with the `auto_flush_expired` option and
+  `prometheus:flush_expired()` (#23).
+
 ## 1.0.0
 
 Starting with this release, this fork (`nginx-lua-prometheus-api7`) uses

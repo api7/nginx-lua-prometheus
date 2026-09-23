@@ -920,6 +920,63 @@ function TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict()
   luaunit.assertNotNil(self.dict.dict["permanent"])
 end
 
+-- flush_expired() holds the dict lock for its whole scan of the LRU queue, so
+-- the reclamation is issued in bounded batches. A backlog larger than one batch
+-- must still be reclaimed in full, by looping.
+function TestKeyIndex:testFlushExpiredRunsInBatches()
+  local expired = 20000
+  for i = 1, expired do
+    self.dict:set("value_" .. i, 1, 1)
+  end
+  -- A permanent entry, like the error metric or any metric without an exptime.
+  self.dict:set("permanent", 1)
+
+  sleep(2)
+
+  -- record what each call asks the dict to reclaim: an unbounded call would
+  -- hold the dict lock for the whole backlog at once
+  local batches = {}
+  local flush_expired = SimpleDict.flush_expired
+  self.dict.flush_expired = function(dict, n)
+    batches[#batches + 1] = n
+    return flush_expired(dict, n)
+  end
+
+  -- a batch reclaims 10000, so reaching all of them takes more than one call
+  luaunit.assertEquals(self.key_index:flush_expired(), expired)
+  luaunit.assertEquals(batches, {10000, 10000, 10000})
+
+  -- nothing left: the loop must stop after the call that comes back short
+  batches = {}
+  luaunit.assertEquals(self.key_index:flush_expired(), 0)
+  luaunit.assertEquals(batches, {10000})
+
+  self.dict.flush_expired = nil
+  luaunit.assertNotNil(self.dict.dict["permanent"])
+end
+
+-- Callers that schedule the reclamation themselves, in a single process rather
+-- than in every worker, turn the automatic flush off. remove_expired_keys()
+-- must then only drop the worker-local references.
+function TestKeyIndex:testAutoFlushExpiredDisabled()
+  local key_index = require('prometheus_keys').new(self.dict, "_noflush_", 1, false)
+  luaunit.assertEquals(key_index:add("expkey", "eviction_err", 1), nil)
+  -- A metric value key: lives in the same dict, and KeyIndex never reads it.
+  self.dict:set("expkey", 1, 1)
+
+  sleep(2)
+  key_index:remove_expired_keys()
+
+  luaunit.assertNil(key_index.index["expkey"])
+  -- both entries are still physically present, unlike with the default
+  luaunit.assertNotNil(self.dict.dict["_noflush_key_1"])
+  luaunit.assertNotNil(self.dict.dict["expkey"])
+
+  luaunit.assertEquals(key_index:flush_expired(), 2)
+  luaunit.assertNil(self.dict.dict["_noflush_key_1"])
+  luaunit.assertNil(self.dict.dict["expkey"])
+end
+
 -- The index slots of a churning metric must not accumulate: each round expires
 -- the previous slot, and the reclaim must keep the dict bounded rather than
 -- letting every new series step free space down for good.
