@@ -10,6 +10,13 @@ of changes.
   `flush_expired()` call holds the dict lock for a whole backlog, and let
   callers take the reclamation over with the `auto_flush_expired` option and
   `prometheus:flush_expired()` (#23).
+- Reuse the index slots of metrics that have expired instead of handing out a
+  new number every time, and stop broadcasting to the other workers when a
+  metric comes back: renewing a metric no longer reads the shared counters, so
+  one low-frequency series returning no longer sends every worker through a
+  full sync on its request path (apache/apisix#13658). The slot count now
+  tracks the number of live series instead of growing for ever under label
+  churn. See `rfcs/0001-slot-reuse-and-bounded-reclaim.md`.
 
 ## 1.0.0
 
