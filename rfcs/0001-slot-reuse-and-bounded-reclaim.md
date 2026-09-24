@@ -205,6 +205,41 @@ round expiring before the next, on 10 workers:
 | `key_count` after 12 rounds | 383 -> 934 (+50 per round) | 254, flat |
 | consistency check each round | pass | pass |
 
+### 5.3 What the slot-level check cannot see
+
+Comparing what the scrape lists against a walk of `1..key_count` only proves
+the two agree about the *slots*. It cannot catch the failure this design has to
+rule out: a key whose slot was taken by someone else stays unregistered, its
+value is still in the dict, and it is missing from the exposition while every
+slot-level count still matches.
+
+So two further checks run inside the scraping process, on 10 workers:
+
+- **every live value is rendered exactly once** -- the ground truth is the set
+  of dict keys that are not index bookkeeping and still read non-nil, compared
+  against the series in the rendered exposition;
+- **counter values survive slot reuse** -- a known number of increments is
+  driven through all the workers, and each series' value must be exactly that.
+
+To make the reuse actually happen for the counted series, the run retires a
+batch of slots first (20s of churn, then the expiry and one reclaim round), and
+only then registers them, so they take the numbers just given up:
+
+| | v1.0.0 | this branch |
+|---|---|---|
+| entries reclaimed by the round | 0 (hourly timer) | 65,396 |
+| slots added by the 20 counted series | 20 | **5** (15 landed on recycled numbers) |
+| counter values exactly as driven | yes | **yes** |
+| live values in the dict / series rendered | 200,020 / 200,021 | 200,020 / 200,021 |
+| rendered twice | 0 | **0** |
+| live value missing from the output | 0 | **0** |
+| slot-level: listed / live slots / duplicates / missing | 200,021 / 200,021 / 0 / 0 | 200,021 / 200,021 / 0 / 0 |
+
+The one series rendered without a value is the same on both variants: it expired
+between the enumeration and the render, which is a race in the check, not in the
+library. The same two checks also pass at 300k series with churn running
+throughout (1,500 new series/s).
+
 ## 6. Performance report
 
 20-core x86-64, OpenResty 1.29.2.4, load generator on the same host. Each
