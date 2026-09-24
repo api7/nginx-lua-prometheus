@@ -240,6 +240,75 @@ between the enumeration and the render, which is a race in the check, not in the
 library. The same two checks also pass at 300k series with churn running
 throughout (1,500 new series/s).
 
+### 5.4 Scenario coverage
+
+Every row is a scenario this design has to survive, what it must guarantee, and
+where the evidence is. "unit" is `prometheus_test.lua`; the rest run on
+OpenResty with 10 workers and the privileged agent.
+
+| scenario | must hold | evidence |
+|---|---|---|
+| steady state, 300k and 1.5M series | output = live set, no duplicates | multi-worker, §5.2 |
+| a series expires | it leaves the output | unit + multi-worker |
+| it comes back, node still there (state 2) | same slot, nothing broadcast | unit |
+| it comes back, node reclaimed (state 3) | same slot, peers do not miss it | unit |
+| a dead label's number goes to a new series | correct value, listed once | §5.3, 15 of 20 landed on recycled numbers |
+| a slot only past its ttl | not given to another key | unit |
+| a stale index entry after reuse | must not renew the new occupant | unit |
+| two workers racing for one reclaimed number | one wins, the other takes another | unit |
+| `remove()` frees a number that is then reused | keys do not get mixed up | unit |
+| no `exptime` at all (the APISIX default) | none of the reuse machinery engages | unit + §6.2 |
+| `key_count` LRU-evicted | a slot above it is still listed | unit |
+| the trail is shorter than the scrape's lag | fall back to walking every slot | unit |
+| a trail entry is evicted | same fallback | unit |
+| slots inherited from an earlier generation | reused, not stranded | unit + §5.5 |
+| in-place upgrade from 1.0.0, shm kept | correct from the first scrape | §5.5 |
+| rollback to 1.0.0 over a dict this code wrote | 1.0.0 stays correct | §5.5 |
+| a dict kept at 0 free space | *neither* version is correct here -- see §5.6 | §5.6 |
+| counter values across all of the above | exactly what was driven | §5.3 |
+
+### 5.5 Upgrade and rollback
+
+A reload keeps the shm zone, so swapping the library under a running instance is
+what an in-place upgrade looks like: the new code inherits a dict that 1.0.0
+wrote -- 39k dead slots, `key_count` well above the live count, no trail -- and
+then 1.0.0 inherits one this code wrote, with reused slots and a trail it knows
+nothing about.
+
+| stage | `key_count` | live slots | duplicates | live values missing | first scrape |
+|---|---|---|---|---|---|
+| on 1.0.0, before | 239,366 | 200,001 | 0 | 0 | -- |
+| after the upgrade | 239,366 | 200,001 | 0 | 0 | 272ms |
+| after 20s of churn on the inherited state | 246,568 | 200,001 | 0 | 0 | -- |
+| after rolling back to 1.0.0 | 246,568 | 200,001 | 0 | 0 | 257ms |
+
+The first run of this exposed a gap rather than a bug: the numbers a previous
+generation of workers gave up are in nobody's `expire_keys`, so they were never
+reused and `key_count` kept the old high-water mark. A reclaim round now also
+walks a slice of the range looking for numbers whose node is gone (a tenth per
+round, one read per slot), which brought the growth over the same 20s of churn
+from +14.6k to +7.2k. The residual is the working set of simultaneously live
+churn series, which has to have numbers.
+
+### 5.6 A dict with no free space
+
+Kept at 0 free space by churn beyond its capacity, with `key_count` evicted as
+well, both versions produce a broken exposition: of ~405k live values, 381k
+(1.0.0) and 301k (this branch) were missing from the output, and `key_count`
+itself was evicted and restarted. Slot reuse does not fix this and does not make
+it worse -- it is what the dict does when it is too small for the cardinality,
+and it is the state that apache/apisix#13658's bloat drives a gateway into.
+
+Under a churn rate the dict *can* absorb (3,000 new series/s for 60s on 100m,
+starting from 150k live series), both stay correct, all 500 continuously-hit
+series keep their values, and the difference is the numbering:
+
+| | v1.0.0 | this branch |
+|---|---|---|
+| `key_count` after 60s | 150,501 -> 298,420 | 150,501 -> **260,468** |
+| growth in the last 15s | +12.6k/5s, flat | **+4.5k/5s, falling** |
+| live values missing from the output | 0 | 0 |
+
 ## 6. Performance report
 
 20-core x86-64, OpenResty 1.29.2.4, load generator on the same host. Each
@@ -271,6 +340,22 @@ this branch does not react at all: its request path never reads the shared
 counters, so a bump cannot make it scan.
 
 ### 6.2 Microbenchmarks
+
+Metric shapes, at 200k live series on 100m, with the scrape and the reclamation
+paused:
+
+| path | v1.0.0 | this branch |
+|---|---|---|
+| counter renewal (1 dict write per request) | 0.91 us/op | **0.60 us/op** |
+| histogram renewal (18 keys per observation) | 7.05 us/op | **6.65 us/op** |
+| counter registration | 5.0 us/op | 6.3 us/op |
+| histogram registration | 43 us/op | 49 us/op |
+
+Registration is the one path that pays for reuse: about one extra dict
+operation per key, for `ensure_key_count` and for publishing the number on the
+trail. It happens once per series per worker, against the renewal path that runs
+on every request.
+
 
 | | 100m / 300k | | 500m / 1.5M | |
 |---|---|---|---|---|

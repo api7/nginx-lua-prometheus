@@ -19,7 +19,7 @@ function SimpleDict:set(k, v, exptime)
   end
   return true, nil, forcible
 end
-function SimpleDict:capacity()
+function SimpleDict.capacity()
   return 10 * 1024 * 1024        -- like a lua_shared_dict of 10m
 end
 function SimpleDict:safe_set(k, v, exptime)
@@ -1112,6 +1112,146 @@ function TestKeyIndex:testReclaimedSlotAboveKeyCountIsMadeVisible()
 
   local scraper = require('prometheus_keys').new(self.dict, "_prefix_", 1)
   luaunit.assertEquals(scraper:list(), {"key3"})
+end
+
+
+-- G5: a scrape that has fallen further behind than the trail can hold, or that
+-- finds an entry of it gone, must fall back to walking every slot rather than
+-- trust an incremental sync -- the slots it would miss are live.
+function TestKeyIndex:testScrapeFallsBackWhenTheTrailIsTooShort()
+  luaunit.assertEquals(self.key_index:add("gone", "eviction_err", 1), nil)
+  local scraper = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(#scraper:list(), 1)
+
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(self.key_index:add("newcomer", "eviction_err", 60), nil)
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "newcomer")
+
+  -- the scrape is made to look further behind than the ring can hold
+  scraper.seen_reuse = -scraper.ring_size - 10
+  luaunit.assertEquals(scraper:list(), {"newcomer"})
+end
+
+
+function TestKeyIndex:testScrapeFallsBackWhenATrailEntryIsGone()
+  luaunit.assertEquals(self.key_index:add("gone", "eviction_err", 1), nil)
+  local scraper = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  scraper:list()
+
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(self.key_index:add("newcomer", "eviction_err", 60), nil)
+
+  -- the entry that would point at the reused slot is evicted
+  local seq = self.dict:get("_prefix_reuse_count")
+  self.dict:delete("_prefix_reuse_slot_" .. seq % scraper.ring_size)
+
+  luaunit.assertEquals(scraper:list(), {"newcomer"})
+end
+
+
+-- G6: two workers can put the same reclaimed number aside. Whoever writes it
+-- first keeps it; the other must notice and take a different one, so the key
+-- does not end up sharing a slot.
+function TestKeyIndex:testTwoWorkersRacingForOneReclaimedSlot()
+  local w1 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local w2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(w1:add("gone", "eviction_err", 1), nil)
+  w2:sync()
+
+  sleep(2)
+  w1:remove_expired_keys()
+  w2:remove_expired_keys()
+  -- both now hold slot 1 as reclaimed
+  luaunit.assertEquals(w1.free_slots[w1.free_n], 1)
+  luaunit.assertEquals(w2.free_slots[w2.free_n], 1)
+
+  luaunit.assertEquals(w1:add("first", "eviction_err", 60), nil)
+  luaunit.assertEquals(w2:add("second", "eviction_err", 60), nil)
+
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "first")
+  luaunit.assertNotEquals(w2.index["second"], 1)
+  luaunit.assertEquals(self.dict:get("_prefix_key_" .. w2.index["second"]), "second")
+
+  local scraper = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local listed = {}
+  for _, k in ipairs(scraper:list()) do
+    listed[k] = (listed[k] or 0) + 1
+  end
+  luaunit.assertEquals(listed, {first = 1, second = 1})
+end
+
+
+-- G7: remove() gives the number up for reuse, and a key that is registered
+-- again afterwards must not end up sharing a slot with whoever took it.
+function TestKeyIndex:testRemovedSlotIsReusedWithoutMixingKeys()
+  luaunit.assertEquals(self.key_index:add("dropme", "eviction_err", 60), nil)
+  luaunit.assertEquals(self.key_index:add("stay", "eviction_err", 60), nil)
+  luaunit.assertEquals(self.key_index:remove("dropme", "eviction_err"), nil)
+  luaunit.assertNil(self.key_index.index["dropme"])
+
+  -- the freed number goes to the next key that needs one
+  luaunit.assertEquals(self.key_index:add("newcomer", "eviction_err", 60), nil)
+  luaunit.assertEquals(self.key_index.index["newcomer"], 1)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 2)
+
+  -- and the removed key, registered again, takes a slot of its own
+  luaunit.assertEquals(self.key_index:add("dropme", "eviction_err", 60), nil)
+  luaunit.assertNotEquals(self.key_index.index["dropme"], 1)
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "newcomer")
+
+  local scraper = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local listed = {}
+  for _, k in ipairs(scraper:list()) do
+    listed[k] = (listed[k] or 0) + 1
+  end
+  luaunit.assertEquals(listed, {stay = 1, newcomer = 1, dropme = 1})
+end
+
+
+-- G8: with no exptime -- the default in APISIX -- nothing ever expires, so none
+-- of the reuse machinery may come into play: no slot is ever given up, nothing
+-- is published, and the shared counters stay where they are.
+function TestKeyIndex:testPermanentMetricsNeverReuseSlots()
+  for i = 1, 3 do
+    luaunit.assertEquals(self.key_index:add("perm" .. i, "eviction_err"), nil)
+  end
+  self.key_index:remove_expired_keys()
+  for i = 1, 3 do
+    luaunit.assertEquals(self.key_index:add("perm" .. i, "eviction_err"), nil)
+  end
+
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
+  luaunit.assertEquals(self.dict:get("_prefix_reuse_count"), nil)
+  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), nil)
+  luaunit.assertEquals(self.key_index.free_n, 0)
+  luaunit.assertEquals(#self.key_index:list(), 3)
+end
+
+
+-- G1: the numbers a previous generation of workers gave up -- what an upgrade
+-- or a restart leaves behind -- are in nobody's expire_keys. A worker that
+-- walks the whole range must pick them up, or the inherited backlog is never
+-- reused and the scan range never comes back down.
+function TestKeyIndex:testSlotsInheritedFromAnEarlierGenerationAreReused()
+  for i = 1, 3 do
+    luaunit.assertEquals(self.key_index:add("old" .. i, "eviction_err", 1), nil)
+  end
+  sleep(2)
+  self.key_index:flush_expired()
+
+  -- a worker that starts now has no record of any of them
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(fresh.free_n, 0)
+  fresh:sync()                        -- its first sync walks the whole range
+  luaunit.assertEquals(fresh.free_n, 3)
+
+  for i = 1, 3 do
+    luaunit.assertEquals(fresh:add("new" .. i, "eviction_err", 60), nil)
+  end
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
+  luaunit.assertEquals(#fresh:list(), 3)
 end
 
 

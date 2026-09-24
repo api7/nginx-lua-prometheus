@@ -31,7 +31,14 @@ local FLUSH_EXPIRED_BATCH_DELAY = 1
 -- Slot numbers this worker keeps for reuse after seeing them reclaimed. They
 -- go to the next keys that need one, so a registration costs the same single
 -- write it always did: a number taken in the meantime just fails that write.
-local FREE_SLOTS_KEEP = 1024
+local FREE_SLOTS_KEEP = 8192
+
+-- Slots examined per reclaim round for numbers that died while this worker was
+-- not looking: before it started, or in a slot it never held. A tenth of the
+-- range per round covers all of it in ten, and each slot is one read.
+local RECLAIM_SCAN_DIVISOR = 10
+local RECLAIM_SCAN_MIN = 1000
+local RECLAIM_SCAN_MAX = 50000
 
 -- Reclaimed numbers tried before falling back to a fresh slot past key_count.
 local FREE_SLOT_ATTEMPTS = 4
@@ -72,6 +79,7 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   self.seen_reuse = 0
   self.free_slots = {}
   self.free_n = 0
+  self.scan_cursor = 1
   self.last = 0
   self.deleted = 0
   self.not_expired_index = 1
@@ -136,6 +144,48 @@ function KeyIndex:remove_expired_keys()
       self:hide_slot(i)
     end
   end
+
+  self:scan_for_free_slots()
+end
+
+
+-- The loop above only reaches the slots this worker registered itself. A number
+-- that died before it started -- what a reload or a restart leaves behind -- or
+-- one that died in a slot it never held is in nobody's expire_keys here, and
+-- without this pass it would never be reused: key_count would keep the high
+-- water mark of the previous generation for ever.
+function KeyIndex:scan_for_free_slots()
+  local last = self.dict:get(self.key_count) or 0
+  if last < 1 or self.free_n >= FREE_SLOTS_KEEP then
+    return
+  end
+
+  local window = math.max(RECLAIM_SCAN_MIN,
+    math.min(RECLAIM_SCAN_MAX, math.floor(last / RECLAIM_SCAN_DIVISOR)))
+  local i = self.scan_cursor
+  for _ = 1, window do
+    if i > last then
+      i = 1
+    end
+
+    if not self.keys[i] and self.dict:get(self.key_prefix .. i) == nil then
+      -- only a node that is gone frees its number; one that is merely past its
+      -- ttl still belongs to the key that can take it back
+      local _, err = self.dict:ttl(self.key_prefix .. i)
+      if err == "not found" then
+        self.free_n = self.free_n + 1
+        self.free_slots[self.free_n] = i
+        if self.free_n >= FREE_SLOTS_KEEP then
+          i = i + 1
+          break
+        end
+      end
+    end
+
+    i = i + 1
+  end
+
+  self.scan_cursor = i
 end
 
 
@@ -192,6 +242,12 @@ end
 
 -- Iterates keys from first to last, adds new items and removes deleted items.
 function KeyIndex:sync_range(first, last)
+  -- A walk of the whole range is also the only chance a worker gets to notice
+  -- the slots that died before it started -- after a reload, or a restart, the
+  -- numbers a previous generation gave up are in nobody's expire_keys, and
+  -- without this they would never be reused.
+  local whole_range = first == 0
+
   for i = first, last do
     -- Read i-th key. If it is nil, it means it was deleted by some other thread.
     local key = self.dict:get(self.key_prefix .. i)
@@ -204,6 +260,16 @@ function KeyIndex:sync_range(first, last)
         if ttl and ttl ~= 0 then
           self.expire_keys[i] = true
         end
+      end
+    elseif whole_range and i > 0 and not self.keys[i]
+           and self.free_n < FREE_SLOTS_KEEP then
+      -- a slot this worker has no record of: only its node being gone makes the
+      -- number reusable, and only ttl() can tell that from a node that is
+      -- merely past its ttl and still belongs to its own key
+      local _, err = self.dict:ttl(self.key_prefix .. i)
+      if err == "not found" then
+        self.free_n = self.free_n + 1
+        self.free_slots[self.free_n] = i
       end
     elseif self.keys[i] then
       -- The slot holds no live key, which is all a scrape needs to know, so it
