@@ -16,7 +16,7 @@ of changes.
   one low-frequency series returning no longer sends every worker through a
   full sync on its request path (apache/apisix#13658). The slot count now
   tracks the number of live series instead of growing for ever under label
-  churn. See `rfcs/0001-slot-reuse-and-bounded-reclaim.md`.
+  churn. Design and measurements: api7/rfcs#290.
 
 ## 1.0.0
 
