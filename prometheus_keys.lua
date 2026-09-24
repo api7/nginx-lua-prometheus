@@ -49,9 +49,12 @@ local FREE_SLOT_ATTEMPTS = 4
 -- publishing one is an in-place write that cannot fail for want of memory --
 -- on a full dict a write that had to allocate would either evict a metric or
 -- be dropped, and a dropped one costs the scrape a walk over every slot.
+-- One entry per 16 KiB of the dict, so the trail costs about 0.9% of it and
+-- covers a few thousand reuses between two scrapes -- past that the scrape
+-- walks every slot, which is correct but is what the trail exists to avoid.
 local REUSE_RING_MAX = 8192
-local REUSE_RING_MIN = 256
-local REUSE_RING_BYTES_PER_ENTRY = 65536
+local REUSE_RING_MIN = 1024
+local REUSE_RING_BYTES_PER_ENTRY = 16384
 local REUSE_ENTRY_FORMAT = "%012d:%09d"
 
 -- Attempts at raising key_count above a slot number. Concurrent raises can
@@ -88,8 +91,6 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   self.hidden = {}
   self.expire_keys = {}
 
-  -- One entry per 64 KiB of the dict, so the trail costs about 0.2% of it and
-  -- stays useful on the dicts big enough for a full scan to be expensive.
   local capacity = self.dict.capacity and self.dict:capacity() or 0
   self.ring_size = math.max(REUSE_RING_MIN,
     math.min(REUSE_RING_MAX, math.floor(capacity / REUSE_RING_BYTES_PER_ENTRY)))

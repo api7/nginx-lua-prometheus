@@ -395,6 +395,27 @@ scrape and, on a full dict, could not publish its trail, so the scrape fell back
 to that walk permanently. It measured p90 500ms against 123ms for v1.0.0 in the
 20k req/s run. Both causes were fixed (3.5, 3.6).
 
+### 6.4 Fifteen minutes of churn
+
+1,500 new series/s on a 100m dict, 10 workers, starting from 150k long-lived
+series:
+
+| | v1.0.0 | this branch |
+|---|---|---|
+| `key_count` at 1 min | 222,520 | 195,734 |
+| at 5 min | 522,930 | 235,288 |
+| at 15 min | **1,318,746** | **303,422** |
+| growth in the last minute | +81k, linear | **+5k, falling** |
+| dict free space | stable | stable |
+| scrape | 220-243ms | 228-237ms |
+| duplicates / live values missing at the end | 0 / 0 | 0 / 0 |
+
+The first run of this had the scrape at 340-450ms on the branch, because the
+trail was sized at one entry per 64 KiB -- 1,600 entries on a 100m dict -- while
+1,500 new series/s over a 2s scrape interval is 3,000 reuses, so every scrape
+fell back to walking every slot. One entry per 16 KiB (§3.5) covers that rate and
+brings the scrape back in line; the fallback remains for anything faster.
+
 ### 6.4 Reclamation lock hold (`resty --shdict`, single process)
 
 | dict contents | call | lock hold |
