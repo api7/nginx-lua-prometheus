@@ -56,25 +56,34 @@ end
 
 -- check and remove expired keys
 function KeyIndex:remove_expired_keys()
-  for i, _ in pairs(self.expire_keys) do
-    -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
-    local ttl, err = self.dict:ttl(self.key_prefix .. i)
-    if not (ttl and ttl >= 0 or err and err ~= "not found") then
-      if self.keys[i] then
-        self.index[self.keys[i]] = nil
-        self.keys[i] = nil
-      end
-      self.expire_keys[i] = nil
-    end
-  end
-
-  -- The loop above only drops worker-local references, so the expired entries
-  -- still have to be reclaimed from the dict itself. Callers that schedule
-  -- flush_expired() themselves -- in a single process rather than in every
-  -- worker -- turn this off with auto_flush_expired.
+  -- Reclaiming first means the scan below sees the final state of every slot,
+  -- so a number whose node has just been reclaimed is given up in this round
+  -- rather than the next. Callers that schedule flush_expired() themselves --
+  -- in a single process rather than in every worker -- turn this off with
+  -- auto_flush_expired.
   if self.auto_flush_expired then
     self:flush_expired()
   end
+
+  for i, _ in pairs(self.expire_keys) do
+    -- A slot is in one of three states, and only ttl() tells them apart --
+    -- get() reports the last two alike, as nil:
+    --
+    --   (1) live:                                 ttl > 0
+    --   (2) past its ttl, node still in the dict:  ttl < 0
+    --   (3) node physically reclaimed:             "not found"
+    --
+    -- In state (2) the node is still there and expire() resurrects it with its
+    -- value intact, so the slot is left exactly as it is: the key keeps its
+    -- number and comes back on it. Listing it in the meantime costs nothing --
+    -- metric_data() skips a key whose value has expired. Only state (3) gives
+    -- the number up.
+    local _, err = self.dict:ttl(self.key_prefix .. i)
+    if err == "not found" then
+      self:forget_slot(i)
+    end
+  end
+
 end
 
 
@@ -146,12 +155,33 @@ function KeyIndex:sync_range(first, last)
         end
       end
     elseif self.keys[i] then
-      self.index[self.keys[i]] = nil
-      self.keys[i] = nil
-      self.expire_keys[i] = nil
+      -- get() cannot tell a slot that is merely past its ttl from one whose
+      -- node is gone, and the two must not be treated alike: the first keeps
+      -- its number (see remove_expired_keys), only the second gives it up.
+      local _, err = self.dict:ttl(self.key_prefix .. i)
+      if err == "not found" then
+        self:forget_slot(i)
+      end
     end
   end
   self.last = last
+end
+
+
+-- Drops every local reference to a slot whose node is gone.
+--
+-- self.keys (slot -> key) and self.index (key -> slot) are two views of one
+-- mapping, and the index entry is only this slot's to drop while it still
+-- points here. A key that has since moved to another slot keeps a live entry
+-- there, and dropping it would hide that key from list() although its value is
+-- in the dict -- which is what the delete_count broadcast used to paper over.
+function KeyIndex:forget_slot(i)
+  local key = self.keys[i]
+  if key and self.index[key] == i then
+    self.index[key] = nil
+  end
+  self.keys[i] = nil
+  self.expire_keys[i] = nil
 end
 
 -- Returns array of all keys.
@@ -194,6 +224,24 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     local retried = false
     local repairs = 0
     local repair_forcible = false
+
+    -- The common case by far: this key has a slot and the slot still holds it,
+    -- so only its ttl has to be pushed out. Reading the slot costs one dict
+    -- read where sync() costs two, and none of the shared counters are touched
+    -- -- so nothing another worker does can turn this into a full sync.
+    local mine = self.index[key]
+    if mine and exptime and self.dict:get(self.key_prefix .. mine) == key then
+      local ok, err = self.dict:expire(self.key_prefix .. mine, exptime)
+      if ok then
+        goto renewed
+      end
+      if err ~= "not found" then
+        ngx.log(ngx.ERR, "failed to renew expire for key '", key, "': ",
+                tostring(err))
+        goto renewed
+      end
+    end
+
     while true do
       local N = self:sync()
       if self.index[key] ~= nil then
@@ -203,22 +251,15 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
           local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
           if not ok then
             if err == "not found" then
-              -- The slot already expired in the shared dict. Drop the stale
-              -- local state and bump delete_count so other workers do a full
-              -- sync and reclaim the slot; without this the old slot lingers in
-              -- their local self.keys while the metric is re-added at a new slot,
-              -- desynchronizing the index and causing duplicate metric emission.
-              -- The dict slot is already gone (expire returned "not found"), so
-              -- there is no slot to clear here.
-              local idx = self.index[key]
-              self.index[key] = nil
-              self.keys[idx] = nil
-              self.expire_keys[idx] = nil
-              self.deleted = self.deleted + 1
-              local _, incr_err, forcible = self.dict:incr(self.delete_count, 1, 0)
-              if incr_err or forcible then
-                return incr_err or err_msg_lru_eviction
-              end
+              -- The node is gone, so this number is no longer ours to renew.
+              -- The key takes a fresh slot below, which is above every worker's
+              -- self.last and is therefore picked up by their incremental sync
+              -- -- nothing has to be broadcast. Bumping delete_count here, as
+              -- this used to, sent every worker through a full sync of
+              -- key_count slots on its request path, and made each of them
+              -- forget every slot that was merely past its ttl, so those
+              -- metrics took new numbers too (apache/apisix#13658).
+              self:forget_slot(self.index[key])
               expired = true
             else
               -- Unexpected expire error: the slot may still be live, so leave it
@@ -295,6 +336,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       end
       retried = true
     end
+    ::renewed::
   end
 end
 
@@ -305,9 +347,7 @@ end
 function KeyIndex:remove(key, err_msg_lru_eviction)
   local i = self.index[key]
   if i then
-    self.index[key] = nil
-    self.keys[i] = nil
-    self.expire_keys[i] = nil
+    self:forget_slot(i)
     self.dict:set(self.key_prefix .. i, nil)
     self.deleted = self.deleted + 1
 
