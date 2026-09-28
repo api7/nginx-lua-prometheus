@@ -28,6 +28,15 @@ of changes.
   at least twice the longest a round can take, and let callers take the
   reclamation over with the `auto_flush_expired` option and
   `prometheus:flush_expired()` (#23).
+- Stop consuming a new index slot, and stop broadcasting to the other workers,
+  when a metric that has expired comes back. A slot whose node is still in the
+  dict is resurrected in place, and only a slot whose node is gone gives its
+  number up -- `ttl()` tells the two apart where `get()` cannot. Renewing a
+  metric now reads its own slot instead of the shared counters, so nothing
+  another worker does can send it through a full sync on the request path. One
+  returning series used to take the worker set from 14.9% to 30.2% CPU and 50 of
+  them to 287.7%, with three workers at ~90-99% of a core (apache/apisix#13658,
+  apache/apisix#11934). Design and measurements: api7/rfcs#290.
 
 ## 1.0.0
 
