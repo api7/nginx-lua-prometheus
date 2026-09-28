@@ -19,6 +19,18 @@ function SimpleDict:set(k, v, exptime)
   end
   return true, nil, forcible
 end
+function SimpleDict.capacity()
+  return 10 * 1024 * 1024        -- like a lua_shared_dict of 10m
+end
+function SimpleDict:safe_set(k, v, exptime)
+  -- like ngx.shared.DICT:safe_set: never evicts, so in this mock, which never
+  -- runs out of memory, it behaves as set()
+  return self:set(k, v, exptime)
+end
+function SimpleDict:safe_add(k, v, exptime)
+  -- and like safe_add, which never evicts either
+  return self:add(k, v, exptime)
+end
 function SimpleDict:add(k, v, exptime)
   local forcible = false
   if k == "willnotfitk" or v == "willnotfitv" then
@@ -1006,6 +1018,25 @@ function TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict()
   self.key_index:remove_expired_keys()
   luaunit.assertNil(self.key_index.index["expkey"])
 end
+
+-- On a full dict a slot must not be written by evicting something else: a plain
+-- add() drops the LRU tail, which is a cold permanent entry -- the error metric,
+-- a metric registered without an expire, or key_count itself. safe_add() fails
+-- instead, and the failure has to reach the caller so that it lands on the error
+-- metric rather than passing silently.
+function TestKeyIndex:testNoMemoryIsReportedRatherThanEvicting()
+  local full = setmetatable({}, SimpleDict)
+  full.safe_add = function() return nil, "no memory" end
+  full.get = function() return nil end
+  full.incr = function() return 1 end
+  full.ttl = function() return nil, "not found" end
+  local key_index = require('prometheus_keys').new(full, "_full_", 1)
+
+  local err = key_index:add("newkey", "eviction_err", 60)
+  luaunit.assertNotNil(err)
+  luaunit.assertStrContains(err, "no memory")
+end
+
 
 -- flush_expired() holds the dict lock for its whole scan of the LRU queue, so
 -- the reclamation is issued in bounded batches. A backlog larger than one batch

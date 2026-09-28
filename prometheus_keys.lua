@@ -282,7 +282,17 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         end
       end
       N = N+1
-      local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, exptime)
+      -- safe_add, so that a full dict costs a metric that cannot be registered
+      -- rather than one that is evicted to make room: a plain add() would drop
+      -- the LRU tail, which is a cold permanent entry -- the error metric, a
+      -- metric configured without an expire, or key_count itself, whose loss
+      -- makes every slot above the rebuilt counter invisible. "no memory" is
+      -- returned to the caller, which accounts for it on the error metric.
+      local ok, err, forcible = self.dict:safe_add(self.key_prefix .. N, key, exptime)
+      if err == "no memory" then
+        return err_msg_lru_eviction .. "; key index: no memory for idx=" ..
+               self.key_prefix .. N .. ", key=" .. key
+      end
       if ok then
         local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
         self.keys[N] = key

@@ -19,6 +19,13 @@ of changes.
   returning series used to take the worker set from 14.9% to 30.2% CPU and 50 of
   them to 287.7%, with three workers at ~90-99% of a core (apache/apisix#13658,
   apache/apisix#11934). Design and measurements: api7/rfcs#290.
+- Write index slots and gauge values with `safe_add`/`safe_set`, so that a full
+  dict costs a metric that cannot be registered rather than one that is evicted
+  to make room: a plain write drops the LRU tail, which is a cold permanent
+  entry -- the error metric, a metric registered without an expire, or
+  `key_count` itself, whose loss makes every slot above the rebuilt counter
+  invisible. The failure is reported to the caller, so it lands on
+  `nginx_metric_errors_total` instead of passing silently.
 
 ## 1.0.0
 

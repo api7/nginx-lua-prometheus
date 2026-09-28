@@ -579,7 +579,9 @@ local function set(self, value, label_values)
     self._log_error(err)
     return
   end
-  _, err, forcible = self._dict:set(k, value, self.exptime)
+  -- safe_set for the same reason as the index slots: on a full dict this fails
+  -- instead of evicting another metric to make room for this one.
+  _, err, forcible = self._dict:safe_set(k, value, self.exptime)
   if err or forcible then
     self._log_error_kv(k, value, err or ERR_MSG_LRU_EVICTION)
   end
