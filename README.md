@@ -119,6 +119,12 @@ section of nginx configuration.
     reclamation can occupy its timer for up to 10 seconds and must not take
     more than half of its own interval.
 
+    A round does bounded work -- it reclaims at most a batch of entries and
+    walks a slice of the slot range, resuming where the previous round stopped
+    -- so its cost does not grow with the number of metrics. A full sweep of
+    the slot range takes `key_count / 10000` rounds, which only delays dropping
+    the worker-local reference to a slot whose entry is already gone.
+
     The interval decides how much backlog one round has to reclaim -- the
     expiry rate times the interval, times two, since a series leaves a value
     key and an index slot behind. Two things follow from that. A backlog larger

@@ -127,11 +127,24 @@ local DEFAULT_SYNC_INTERVAL = 1
 -- past that the tail starts to move. 60s keeps a round inside that zone for
 -- expiry rates up to ~100 series/s.
 --
--- Running often is cheap, which is what makes the choice asymmetric: a round
--- with nothing to reclaim costs only the LRU walk -- 1.8-9.5ms depending on how
--- full the dict is -- so 60s spends ~0.4s of lock time per hour per worker
--- against ~0.06s at 3600s. Being too frequent costs fractions of a percent of a
--- core; being too rare destroys live metrics.
+-- Running often has to be cheap for any of this to hold, and it is only cheap
+-- because a round does bounded work: both the reclamation and the local scan
+-- are sliced (see FLUSH_EXPIRED_BATCH and REMOVE_EXPIRED_KEYS_SCAN_SLOTS), and
+-- the per-worker timers are spread over the interval instead of all firing at
+-- init_worker. Measured with 150,000 expiring series of which none actually
+-- expires during the run, so every round is empty:
+--
+--   interval   p99      p99.9     max
+--   600s (no round fired, the control)   2.02ms   2.38ms   9.93ms
+--   60s,  unbounded round               2.30ms   418.30ms 533.50ms
+--   20s,  unbounded round               280.32ms 473.86ms 568.32ms
+--   60s,  bounded round                 2.04ms   2.81ms   27.45ms
+--   20s,  bounded round                 2.07ms   4.36ms   27.76ms
+--
+-- With the round bounded, 60s is indistinguishable from not reclaiming at all,
+-- and it also lets the local scan finish a full sweep in minutes rather than
+-- days. Being too frequent then costs almost nothing, while being too rare
+-- destroys live metrics -- which is what settles the choice.
 local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 60
 
 -- Shortest interval accepted: a round may occupy its timer for

@@ -126,6 +126,7 @@ end
 function Nginx.sleep() end
 Nginx.timer = {}
 function Nginx.timer.every(_, _, _) end
+function Nginx.timer.at(_, _, _) end
 function Nginx.get_phase()
   return 'init_worker'
 end
@@ -988,6 +989,44 @@ function TestKeyIndex:testFlushExpiredRunsInBatches()
 
   self.dict.flush_expired = nil
   luaunit.assertNotNil(self.dict.dict["permanent"])
+end
+
+-- The local scan asks the dict for the ttl of every slot the worker knows has
+-- one, which is a lock acquisition per slot and is what a round actually costs.
+-- It must therefore walk a bounded slice per round and resume where the
+-- previous round stopped.
+function TestKeyIndex:testRemoveExpiredKeysScansASlicePerRound()
+  local slice = self.key_index.REMOVE_EXPIRED_KEYS_SCAN_SLOTS
+  local keys = {}
+  for i = 1, slice + 10 do
+    keys[i] = "sliced_" .. i
+  end
+  luaunit.assertEquals(self.key_index:add(keys, "eviction_err", 600), nil)
+
+  local checked = 0
+  local ttl = SimpleDict.ttl
+  self.dict.ttl = function(dict, k)
+    checked = checked + 1
+    return ttl(dict, k)
+  end
+
+  self.key_index:remove_expired_keys()
+  local first = checked
+  luaunit.assertTrue(first <= slice)
+  -- it really did stop short of the whole range
+  luaunit.assertTrue(first < slice + 10)
+
+  checked = 0
+  self.key_index:remove_expired_keys()
+  -- the next round picks up the rest, and the slots are each checked once
+  luaunit.assertEquals(first + checked, slice + 10)
+
+  -- a live slot is kept, whichever round reached it
+  luaunit.assertNotNil(self.key_index.index["sliced_1"])
+  luaunit.assertNotNil(self.key_index.index["sliced_" .. (slice + 10)])
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
 end
 
 -- One round yields between batches, so the timer can fire again before it
