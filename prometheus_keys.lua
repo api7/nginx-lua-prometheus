@@ -47,18 +47,22 @@ local FLUSH_EXPIRED_BATCH_DELAY = 1
 
 -- Slot numbers the local scan of remove_expired_keys() may walk in one round.
 --
--- That scan asks the dict for the ttl of every slot the worker knows has one,
--- which is a lock acquisition per slot, and it is what a round actually costs:
--- with 150,000 such slots across 8 workers and a steady 20k rps it showed up as
--- a ~480ms stall at p99.9, of which the reclamation itself was 5%. A tenth of
--- the slots made it a ~40ms stall, so the cost is linear in them and has to be
--- bounded the way the reclamation is.
+-- Asking the dict for a slot's ttl is a lock acquisition, and doing it for
+-- every slot the worker knows has one is what a round used to cost: with
+-- 150,000 such slots across 8 workers and a steady 20k rps it showed up as a
+-- ~480ms stall at p99.9, of which the reclamation itself was 5%. A tenth of the
+-- slots made it a ~40ms stall, so the cost was linear in them.
 --
--- The scan therefore walks a slice of the slot range per round and resumes
--- where the previous round stopped. A full sweep takes key_count divided by
--- this many rounds, which only delays dropping the worker-local reference to a
--- slot whose node is already gone -- nothing reads it in the meantime, because
--- every dict API reports that slot as missing anyway.
+-- Two things bound it now. The scan skips any slot whose recorded deadline has
+-- not passed, without touching the dict, so the lock acquisitions are
+-- proportional to what has actually lapsed rather than to the index. And it
+-- walks only a slice of the slot range per round, resuming where the previous
+-- round stopped, so even a round where everything has lapsed stays bounded.
+--
+-- A full sweep then takes key_count divided by this many rounds, which only
+-- delays dropping the worker-local reference to a slot whose node is already
+-- gone -- nothing reads it in the meantime, because every dict API reports that
+-- slot as missing anyway.
 local REMOVE_EXPIRED_KEYS_SCAN_SLOTS = 10000
 
 
@@ -143,8 +147,17 @@ function KeyIndex:remove_expired_keys()
   end
   self.scan_cursor = to + 1
 
+  local now = ngx.now()
   for i = from, to do
-    if self.expire_keys[i] then
+    -- self.expire_keys[i] is when this worker last saw slot i expire. While
+    -- that is still in the future the slot was there and nothing but a forced
+    -- eviction can have taken it, so there is nothing to ask the dict -- which
+    -- is what makes a round cost nothing when nothing has lapsed. Should a
+    -- forced eviction have taken it anyway, the only consequence is a local
+    -- reference that outlives its slot, and add() drops it on the next
+    -- observation of that key.
+    local deadline = self.expire_keys[i]
+    if deadline and deadline <= now then
       -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
       local ttl, err = self.dict:ttl(self.key_prefix .. i)
       if not (ttl and ttl >= 0 or err and err ~= "not found") then
@@ -153,6 +166,10 @@ function KeyIndex:remove_expired_keys()
           self.keys[i] = nil
         end
         self.expire_keys[i] = nil
+      else
+        -- still there: another worker renewed it, so wait out the new ttl
+        -- instead of asking again every round
+        self.expire_keys[i] = now + ttl
       end
     end
   end
@@ -255,11 +272,11 @@ function KeyIndex:sync_range(first, last)
       self.keys[i] = key
       self.index[key] = i
 
-      -- if it is nil and ttl not is 0, set expire_keys map
+      -- if it is nil and ttl not is 0, record when the slot expires
       if not self.expire_keys[i] then
         local ttl, _ = self.dict:ttl(self.key_prefix .. i)
         if ttl and ttl ~= 0 then
-          self.expire_keys[i] = true
+          self.expire_keys[i] = ngx.now() + ttl
         end
       end
     elseif self.keys[i] then
@@ -307,6 +324,10 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     keys = { key_or_keys }
   end
 
+  -- when the slot's expiry is renewed or set below, remember when it lands, so
+  -- that remove_expired_keys() does not have to ask the dict about it
+  local now = exptime and exptime > 0 and ngx.now()
+
   for _, key in pairs(keys) do
     local retried = false
     local repairs = 0
@@ -318,6 +339,9 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         local expired = false
         if exptime then
           local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
+          if ok and now then
+            self.expire_keys[self.index[key]] = now + exptime
+          end
           if not ok then
             if err == "not found" then
               -- The slot already expired in the shared dict. Drop the stale
@@ -363,8 +387,8 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
         self.keys[N] = key
         self.index[key] = N
-        if exptime and exptime > 0 then
-          self.expire_keys[N] = true
+        if now then
+          self.expire_keys[N] = now + exptime
         end
         if forcible or forcible2 or repair_forcible then
           return (err_msg_lru_eviction .. "; key index: add key: idx=" ..

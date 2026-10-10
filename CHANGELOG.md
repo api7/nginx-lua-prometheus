@@ -14,9 +14,12 @@ of changes.
   (#23).
 - Bound the work one round of `remove_expired_keys()` does, and spread the
   per-worker timers over the interval instead of firing them all at
-  `init_worker`. The local scan asks the dict for the ttl of every slot the
-  worker knows has one; with 150,000 of them across 8 workers that was a
-  ~480ms stall at p99.9 on a steady 20k rps, against 2.81ms once sliced (#23).
+  `init_worker`. Asking the dict for a slot's ttl is a lock acquisition, and
+  the scan did it for every slot the worker knew had one: with 150,000 of them
+  across 8 workers that was a ~480ms stall at p99.9 on a steady 20k rps. It now
+  skips the slots whose recorded deadline has not passed and walks a bounded
+  slice of the rest, which brings the same case to 2.38ms -- the same as not
+  reclaiming at all (#23).
 - Reclaim expired shared-dict entries in batches, so no single
   `flush_expired()` call holds the dict lock for a whole backlog, refuse
   overlapping reclamation rounds, require `remove_expired_keys_interval` to be

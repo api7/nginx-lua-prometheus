@@ -124,6 +124,10 @@ function Nginx.worker.id()
   return 'testworker'
 end
 function Nginx.sleep() end
+function Nginx.now()
+  -- the SimpleDict mock keeps expiry in os.time() units
+  return os.time()
+end
 Nginx.timer = {}
 function Nginx.timer.every(_, _, _) end
 function Nginx.timer.at(_, _, _) end
@@ -991,10 +995,35 @@ function TestKeyIndex:testFlushExpiredRunsInBatches()
   luaunit.assertNotNil(self.dict.dict["permanent"])
 end
 
--- The local scan asks the dict for the ttl of every slot the worker knows has
--- one, which is a lock acquisition per slot and is what a round actually costs.
--- It must therefore walk a bounded slice per round and resume where the
--- previous round stopped.
+-- The local scan is what a round actually costs: a lock acquisition per slot
+-- the worker knows has a ttl. It avoids most of them by remembering when it
+-- recorded each slot expiring, and asking the dict only once that has passed --
+-- so while the metrics are being renewed a round touches the dict not at all.
+function TestKeyIndex:testRemoveExpiredKeysSkipsSlotsThatCannotHaveLapsed()
+  local keys = {}
+  for i = 1, 100 do
+    keys[i] = "live_" .. i
+  end
+  luaunit.assertEquals(self.key_index:add(keys, "eviction_err", 600), nil)
+
+  local checked = 0
+  local ttl = SimpleDict.ttl
+  self.dict.ttl = function(dict, k)
+    checked = checked + 1
+    return ttl(dict, k)
+  end
+
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(checked, 0)
+  luaunit.assertEquals(self.key_index.index["live_1"], 1)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- The slots whose deadline has passed do have to be asked about, and there can
+-- be as many of them as the index is large, so the scan walks a bounded slice
+-- per round and resumes where the previous round stopped.
 function TestKeyIndex:testRemoveExpiredKeysScansASlicePerRound()
   local slice = self.key_index.REMOVE_EXPIRED_KEYS_SCAN_SLOTS
   local keys = {}
@@ -1002,6 +1031,12 @@ function TestKeyIndex:testRemoveExpiredKeysScansASlicePerRound()
     keys[i] = "sliced_" .. i
   end
   luaunit.assertEquals(self.key_index:add(keys, "eviction_err", 600), nil)
+
+  -- what a round running after the exptime sees, without waiting for it: every
+  -- recorded deadline has passed, so every slot has to be asked about
+  for i in pairs(self.key_index.expire_keys) do
+    self.key_index.expire_keys[i] = 0
+  end
 
   local checked = 0
   local ttl = SimpleDict.ttl
@@ -1018,12 +1053,16 @@ function TestKeyIndex:testRemoveExpiredKeysScansASlicePerRound()
 
   checked = 0
   self.key_index:remove_expired_keys()
-  -- the next round picks up the rest, and the slots are each checked once
+  -- the next round picks up the rest, and each slot is asked about once
   luaunit.assertEquals(first + checked, slice + 10)
 
-  -- a live slot is kept, whichever round reached it
-  luaunit.assertNotNil(self.key_index.index["sliced_1"])
-  luaunit.assertNotNil(self.key_index.index["sliced_" .. (slice + 10)])
+  -- the slots are all still live, so they are kept, and their deadlines are
+  -- refreshed rather than re-checked on every round from now on
+  luaunit.assertEquals(self.key_index.index["sliced_1"], 1)
+  luaunit.assertEquals(self.key_index.index["sliced_" .. (slice + 10)], slice + 10)
+  checked = 0
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(checked, 0)
 
   self.dict.ttl = nil
   luaunit.assertEquals(ngx.logs, nil)
