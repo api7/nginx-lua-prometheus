@@ -6,11 +6,18 @@ of changes.
 
 ## Unreleased
 
+- **Changed the default `remove_expired_keys_interval` from 3600 to 60
+  seconds**, and removed its upper bound. At 3600s an expiry rate of only ~44
+  series/s fills a default-sized dict with dead entries, after which creating a
+  new series force-evicts live metrics (apache/apisix#13658); running the
+  reclamation every 60s costs ~0.4s of dict lock time per hour per worker
+  (#23).
 - Reclaim expired shared-dict entries in batches, so no single
   `flush_expired()` call holds the dict lock for a whole backlog, refuse
   overlapping reclamation rounds, require `remove_expired_keys_interval` to be
-  at least 60 seconds, and let callers take the reclamation over with the
-  `auto_flush_expired` option and `prometheus:flush_expired()` (#23).
+  at least twice the longest a round can take, and let callers take the
+  reclamation over with the `auto_flush_expired` option and
+  `prometheus:flush_expired()` (#23).
 
 ## 1.0.0
 

@@ -92,16 +92,59 @@ local DEFAULT_ERROR_METRIC_NAME = "nginx_metric_errors_total"
 -- Default value for per-worker counter sync interval (seconds).
 local DEFAULT_SYNC_INTERVAL = 1
 
--- Max value for check and remove expired keys interval (seconds).
-local MAX_REMOVE_EXPIRED_KEYS_INTERVAL = 3600
+-- Default interval, in seconds, between two rounds of dropping expired metrics
+-- and reclaiming the dict entries they left behind.
+--
+-- The interval has one observable consequence: how much backlog a round has to
+-- reclaim, which is the expiry rate times the interval times two (a value key
+-- and an index slot per series). Both bounds on it come from that.
+--
+-- The hard bound is the dict: once the backlog no longer fits beside the live
+-- entries, the writes that create new series start force-evicting live ones,
+-- and the dead entries win because they were written last. Measured on a 128m
+-- dict (521,184 entries of a typical shape) holding 100,000 live entries:
+--
+--   backlog written   entries    live entries left after reclaiming
+--   120,000           220,000    100,000
+--   350,000           450,000    100,000
+--   450,000           521,184    71,184   -- 28,816 live metrics destroyed
+--   700,000           521,184    0        -- all of them
+--
+-- At 3600s that bound is reached by an expiry rate of ~44 series/s, which is
+-- ordinary for a gateway with an exptime configured; this is the shape of
+-- apache/apisix#13658. At 60s it takes ~2,675 series/s.
+--
+-- The soft bound is request latency. Same dict, 8 workers, a steady 20k rps,
+-- one reclaim round in the middle:
+--
+--   backlog    calls   one hold   p99      p99.9     max
+--   none       -       -          2.02ms   2.32ms    4.52ms
+--   12,000     1       4.3ms      2.03ms   2.33ms    5.97ms
+--   60,000     2       15.1ms     2.20ms   7.64ms    22.67ms
+--   240,000    5       24.8ms     7.13ms   14.94ms   26.29ms
+--
+-- A backlog of ~12,000 entries is indistinguishable from not reclaiming at all;
+-- past that the tail starts to move. 60s keeps a round inside that zone for
+-- expiry rates up to ~100 series/s.
+--
+-- Running often is cheap, which is what makes the choice asymmetric: a round
+-- with nothing to reclaim costs only the LRU walk -- 1.8-9.5ms depending on how
+-- full the dict is -- so 60s spends ~0.4s of lock time per hour per worker
+-- against ~0.06s at 3600s. Being too frequent costs fractions of a percent of a
+-- core; being too rare destroys live metrics.
+local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 60
 
--- Shortest reclaim interval accepted. A round reclaims in batches with a pause
--- in between, so it can occupy its timer for several seconds (see
--- FLUSH_EXPIRED_MAX_BATCHES and FLUSH_EXPIRED_BATCH_DELAY in
--- prometheus_keys.lua); a round is meant to be a small fraction of the
--- interval, not most of it. Overlapping rounds are refused rather than run, so
--- a shorter interval would only drop rounds silently.
-local MIN_REMOVE_EXPIRED_KEYS_INTERVAL = 60
+-- Shortest interval accepted: a round may occupy its timer for
+-- FLUSH_EXPIRED_MAX_BATCHES * FLUSH_EXPIRED_BATCH_DELAY seconds and must not
+-- take more than half of its own interval. Overlapping rounds are refused
+-- rather than run, so a shorter interval would only drop rounds silently.
+local MIN_REMOVE_EXPIRED_KEYS_INTERVAL =
+  key_index_lib.FLUSH_EXPIRED_MAX_BATCHES *
+  key_index_lib.FLUSH_EXPIRED_BATCH_DELAY * 2
+
+-- There is deliberately no upper bound: how long an interval a deployment can
+-- afford follows from its dict size and expiry rate, which only the caller
+-- knows.
 
 -- Default max size of lookup table
 local DEFAULT_LOOKUP_MAX_SIZE = 1000
@@ -758,15 +801,14 @@ function Prometheus.init(dict_name, options_or_prefix)
       interval = MIN_REMOVE_EXPIRED_KEYS_INTERVAL
     end
     self.remove_expired_keys_interval =
-      interval and interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL and interval
-      or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+      interval or DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
     self.auto_flush_expired = options_or_prefix.auto_flush_expired ~= false
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
-    self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.remove_expired_keys_interval = DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
     self.auto_flush_expired = true
   end
 

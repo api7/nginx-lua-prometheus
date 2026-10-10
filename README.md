@@ -114,12 +114,22 @@ section of nginx configuration.
     metrics or need to minimize memory usage of this library.
   * `remove_expired_keys_interval` (number): how often, in seconds, each worker
     drops the metrics that have expired and reclaims the shared dict entries
-    they left behind. Defaults to 3600, which is also the maximum; values below
-    the minimum of 60 are raised to it, with a warning, because one round of
-    reclamation can occupy its timer for several seconds and is meant to be a
-    small fraction of the interval. Pick it from how much of the dict you are
-    willing to let expired entries hold: they accumulate at the expiry rate
-    times this interval.
+    they left behind. Defaults to 60. There is no upper bound; values below the
+    minimum of 20 are raised to it, with a warning, because one round of
+    reclamation can occupy its timer for up to 10 seconds and must not take
+    more than half of its own interval.
+
+    The interval decides how much backlog one round has to reclaim -- the
+    expiry rate times the interval, times two, since a series leaves a value
+    key and an index slot behind. Two things follow from that. A backlog larger
+    than the dict's spare capacity makes the writes that create new series
+    force-evict live ones, so the interval has a hard ceiling of
+    `(dict entries - live entries) / (2 * expiry rate)`. And a backlog past
+    roughly ten thousand entries starts to show up in the request tail while
+    the lock is held, which puts a softer ceiling at `6000 / expiry rate`. The
+    default is sized for the second one at about 100 expiring series per
+    second; raise it if your churn is lower, and give the dict more room rather
+    than raising it if your churn is higher.
   * `auto_flush_expired` (boolean): whether that reclamation also happens on
     the interval above, in every worker. Defaults to true. Set it to false to
     schedule [`prometheus:flush_expired()`](#prometheusflush_expired) yourself,
