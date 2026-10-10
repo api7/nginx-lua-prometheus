@@ -95,6 +95,14 @@ local DEFAULT_SYNC_INTERVAL = 1
 -- Max value for check and remove expired keys interval (seconds).
 local MAX_REMOVE_EXPIRED_KEYS_INTERVAL = 3600
 
+-- Shortest reclaim interval accepted. A round reclaims in batches with a pause
+-- in between, so it can occupy its timer for several seconds (see
+-- FLUSH_EXPIRED_MAX_BATCHES and FLUSH_EXPIRED_BATCH_DELAY in
+-- prometheus_keys.lua); a round is meant to be a small fraction of the
+-- interval, not most of it. Overlapping rounds are refused rather than run, so
+-- a shorter interval would only drop rounds silently.
+local MIN_REMOVE_EXPIRED_KEYS_INTERVAL = 60
+
 -- Default max size of lookup table
 local DEFAULT_LOOKUP_MAX_SIZE = 1000
 
@@ -742,9 +750,15 @@ function Prometheus.init(dict_name, options_or_prefix)
       DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = options_or_prefix.lookup_max_size or
       DEFAULT_LOOKUP_MAX_SIZE
-    self.remove_expired_keys_interval = options_or_prefix.remove_expired_keys_interval
-        and options_or_prefix.remove_expired_keys_interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-        and options_or_prefix.remove_expired_keys_interval
+    local interval = options_or_prefix.remove_expired_keys_interval
+    if interval and interval < MIN_REMOVE_EXPIRED_KEYS_INTERVAL then
+      ngx.log(ngx.WARN, "remove_expired_keys_interval of ", interval,
+              "s is shorter than the minimum of ",
+              MIN_REMOVE_EXPIRED_KEYS_INTERVAL, "s, using the minimum")
+      interval = MIN_REMOVE_EXPIRED_KEYS_INTERVAL
+    end
+    self.remove_expired_keys_interval =
+      interval and interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL and interval
       or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
     self.auto_flush_expired = options_or_prefix.auto_flush_expired ~= false
   else

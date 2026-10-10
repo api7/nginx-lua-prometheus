@@ -206,9 +206,28 @@ function TestPrometheus:testInitOptions()
   assert(p4.error_metric_name == "foobar")
   assert(p4.remove_expired_keys_interval ~= 0 and p4.remove_expired_keys_interval ~= "")
 
-  local p5 = require('prometheus').init("metrics", {remove_expired_keys_interval=3})
-  assert(p5.remove_expired_keys_interval == 3)
+  local p5 = require('prometheus').init("metrics", {remove_expired_keys_interval=600})
+  assert(p5.remove_expired_keys_interval == 600)
 
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A reclaim round reclaims in batches with a pause in between, so it can occupy
+-- its timer for several seconds. An interval shorter than that is raised to the
+-- minimum, with a warning, rather than left to drop rounds silently.
+function TestPrometheus:testInitClampsTheRemoveExpiredKeysInterval()
+  self.dict = setmetatable({}, SimpleDict)
+  ngx.shared.metrics = self.dict
+
+  local p1 = require('prometheus').init("metrics", {remove_expired_keys_interval=3})
+  assert(p1.remove_expired_keys_interval == 60)
+  luaunit.assertEquals(#ngx.logs, 1)
+  luaunit.assertStrContains(ngx.logs[1], "remove_expired_keys_interval")
+  ngx.logs = nil
+
+  -- the upper bound was already clamped, and silently
+  local p2 = require('prometheus').init("metrics", {remove_expired_keys_interval=7200})
+  assert(p2.remove_expired_keys_interval == 3600)
   luaunit.assertEquals(ngx.logs, nil)
 end
 function TestPrometheus:testInitWorker()
@@ -773,6 +792,9 @@ function TestKeyIndex:setUp()
 end
 function TestKeyIndex.tearDown()
   ngx.logs = nil
+  -- the flush tests stub ngx.sleep; drop the stub here too, so a failing
+  -- assertion before their own restore cannot leak it into the next test
+  ngx.sleep = nil
 end
 function TestKeyIndex.testInit()
   luaunit.assertEquals(ngx.logs, nil)
@@ -924,7 +946,8 @@ end
 -- the reclamation is issued in bounded batches. A backlog larger than one batch
 -- must still be reclaimed in full, by looping.
 function TestKeyIndex:testFlushExpiredRunsInBatches()
-  local expired = 20000
+  local batch = self.key_index.FLUSH_EXPIRED_BATCH
+  local expired = batch + 10
   for i = 1, expired do
     self.dict:set("value_" .. i, 1, 1)
   end
@@ -942,17 +965,68 @@ function TestKeyIndex:testFlushExpiredRunsInBatches()
     return flush_expired(dict, n)
   end
 
-  -- a batch reclaims 10000, so reaching all of them takes more than one call
+  -- the backlog is one entry past a batch, so reaching all of it takes a
+  -- second call, which then comes back short
   luaunit.assertEquals(self.key_index:flush_expired(), expired)
-  luaunit.assertEquals(batches, {10000, 10000, 10000})
+  luaunit.assertEquals(batches, {batch, batch})
 
   -- nothing left: the loop must stop after the call that comes back short
   batches = {}
   luaunit.assertEquals(self.key_index:flush_expired(), 0)
-  luaunit.assertEquals(batches, {10000})
+  luaunit.assertEquals(batches, {batch})
 
   self.dict.flush_expired = nil
   luaunit.assertNotNil(self.dict.dict["permanent"])
+end
+
+-- One round yields between batches, so the timer can fire again before it
+-- finishes -- ngx.timer.every does not wait for the previous run. The second
+-- round must step aside instead of racing this one for the dict lock.
+function TestKeyIndex:testFlushExpiredDoesNotOverlap()
+  local batch = self.key_index.FLUSH_EXPIRED_BATCH
+  for i = 1, batch + 10 do
+    self.dict:set("value_" .. i, 1, 1)
+  end
+
+  sleep(2)
+
+  local reentered
+  ngx.sleep = function()
+    if reentered == nil then
+      reentered = self.key_index:flush_expired()
+    end
+  end
+  local total = self.key_index:flush_expired()
+  ngx.sleep = nil
+
+  luaunit.assertEquals(reentered, 0)
+  -- the round that was already running still reclaims everything
+  luaunit.assertEquals(total, batch + 10)
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A throwing ngx.sleep -- a caller reaching flush_expired() from a phase that
+-- does not allow yielding -- must not leave the guard set, or the worker would
+-- stop reclaiming for good.
+function TestKeyIndex:testFlushExpiredReleasesTheGuardAfterAnError()
+  local batch = self.key_index.FLUSH_EXPIRED_BATCH
+  for i = 1, batch + 10 do
+    self.dict:set("value_" .. i, 1, 1)
+  end
+
+  sleep(2)
+
+  ngx.sleep = function() error("API disabled in the current context") end
+  luaunit.assertEquals(self.key_index:flush_expired(), 0)
+  ngx.sleep = nil
+
+  luaunit.assertEquals(#ngx.logs, 1)
+  luaunit.assertStrContains(ngx.logs[1], "failed to reclaim expired entries")
+  ngx.logs = nil
+
+  -- the guard is released, so what the failed round did not get to is still
+  -- reclaimable
+  luaunit.assertEquals(self.key_index:flush_expired(), 10)
 end
 
 -- Callers that schedule the reclamation themselves, in a single process rather

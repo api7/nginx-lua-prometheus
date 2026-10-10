@@ -14,19 +14,45 @@ KeyIndex.__index = KeyIndex
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
 
--- Entries a single flush_expired() call may reclaim. That call holds the shared
--- dict lock until it returns, so this is what bounds how long the other workers
--- can be kept waiting on the lock: measured at ~1ms per 10000 entries reclaimed
--- on OpenResty 1.29.2.4.
-local FLUSH_EXPIRED_BATCH = 10000
+-- Entries a single flush_expired() call may reclaim.
+--
+-- flush_expired(n) walks the LRU queue from its tail and only stops early once
+-- n entries have been freed, so one call costs
+--
+--   walk_cost * entries in the dict  +  free_cost * entries freed
+--
+-- and only the second term is bounded by n: every call pays the walk again
+-- (measured on OpenResty 1.29.2.4: ~7.5ns and ~90-148ns per entry). A small
+-- batch therefore barely shortens a single hold -- it multiplies the walk, and
+-- with it the total time the lock is held and the number of requests that wait
+-- on it. Reclaiming a 1.5M backlog out of 3M entries took 151 calls and 1771ms
+-- of lock time at n=10000 and pushed the request p99 to 1.53s, against a single
+-- 151ms hold and a p99 of 2.19ms unbounded.
+--
+-- So n is the largest value whose own freeing cost still keeps one hold short
+-- (~5ms here). A normal round -- the expiry rate times the reclaim interval --
+-- is drained in one call, and the batching only comes into play for a backlog
+-- that is not.
+local FLUSH_EXPIRED_BATCH = 50000
 
--- Upper bound on the batches one call may run, so a large backlog is drained
--- over several ticks instead of in a single long stretch. What is left over is
--- picked up by the next tick.
-local FLUSH_EXPIRED_MAX_BATCHES = 30
+-- Upper bound on the batches one round may run, so a backlog that is not normal
+-- -- inherited across an upgrade, or left by a dict that filled up with expired
+-- entries -- is drained over several rounds instead of one long stretch. What is
+-- left over is picked up by the next round.
+local FLUSH_EXPIRED_MAX_BATCHES = 10
 
--- Pause between batches, so the lock is not taken back to back.
+-- Pause between batches, so the lock is not taken back to back. It also bounds
+-- how long one round can occupy its timer: FLUSH_EXPIRED_MAX_BATCHES times this.
 local FLUSH_EXPIRED_BATCH_DELAY = 1
+
+
+-- Exposed so a caller that schedules the reclamation itself can reason about it:
+-- one round drains at most FLUSH_EXPIRED_BATCH * FLUSH_EXPIRED_MAX_BATCHES
+-- entries and may occupy its timer for FLUSH_EXPIRED_MAX_BATCHES *
+-- FLUSH_EXPIRED_BATCH_DELAY seconds.
+KeyIndex.FLUSH_EXPIRED_BATCH = FLUSH_EXPIRED_BATCH
+KeyIndex.FLUSH_EXPIRED_MAX_BATCHES = FLUSH_EXPIRED_MAX_BATCHES
+KeyIndex.FLUSH_EXPIRED_BATCH_DELAY = FLUSH_EXPIRED_BATCH_DELAY
 
 
 -- check and remove expired keys
@@ -97,7 +123,9 @@ end
 -- call, and the workers get the lock back in between.
 --
 -- Returns the number of entries reclaimed.
-function KeyIndex:flush_expired()
+--
+-- The batch loop itself, so that the public entry point below can guard it.
+local function flush_expired_batches(self)
   local total = 0
   for _ = 1, FLUSH_EXPIRED_MAX_BATCHES do
     local freed = self.dict:flush_expired(FLUSH_EXPIRED_BATCH)
@@ -109,6 +137,32 @@ function KeyIndex:flush_expired()
     end
 
     ngx.sleep(FLUSH_EXPIRED_BATCH_DELAY)
+  end
+
+  return total
+end
+
+
+function KeyIndex:flush_expired()
+  -- A round yields between batches, so the timer can fire again before the
+  -- previous run finished (ngx.timer.every does not wait for it), and a caller
+  -- scheduling its own round can overlap with it too. Two rounds racing for the
+  -- dict lock double the stall and reclaim nothing extra, so the second one
+  -- steps aside.
+  if self.flushing then
+    return 0
+  end
+
+  self.flushing = true
+  -- pcall so that a throwing ngx.sleep -- a caller reaching this from a phase
+  -- that does not allow yielding -- cannot leave the guard set and stop the
+  -- reclamation for the life of the worker.
+  local ok, total = pcall(flush_expired_batches, self)
+  self.flushing = false
+
+  if not ok then
+    ngx.log(ngx.ERR, "failed to reclaim expired entries: ", tostring(total))
+    return 0
   end
 
   return total
