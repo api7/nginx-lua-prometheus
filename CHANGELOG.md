@@ -7,9 +7,10 @@ of changes.
 ## Unreleased
 
 - Reclaim expired shared-dict entries in batches, so no single
-  `flush_expired()` call holds the dict lock for a whole backlog, and let
-  callers take the reclamation over with the `auto_flush_expired` option and
-  `prometheus:flush_expired()` (#23).
+  `flush_expired()` call holds the dict lock for a whole backlog, refuse
+  overlapping reclamation rounds, require `remove_expired_keys_interval` to be
+  at least 60 seconds, and let callers take the reclamation over with the
+  `auto_flush_expired` option and `prometheus:flush_expired()` (#23).
 
 ## 1.0.0
 

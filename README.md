@@ -114,7 +114,12 @@ section of nginx configuration.
     metrics or need to minimize memory usage of this library.
   * `remove_expired_keys_interval` (number): how often, in seconds, each worker
     drops the metrics that have expired and reclaims the shared dict entries
-    they left behind. Defaults to 3600, which is also the maximum.
+    they left behind. Defaults to 3600, which is also the maximum; values below
+    the minimum of 60 are raised to it, with a warning, because one round of
+    reclamation can occupy its timer for several seconds and is meant to be a
+    small fraction of the interval. Pick it from how much of the dict you are
+    willing to let expired entries hold: they accumulate at the expiry rate
+    times this interval.
   * `auto_flush_expired` (boolean): whether that reclamation also happens on
     the interval above, in every worker. Defaults to true. Set it to false to
     schedule [`prometheus:flush_expired()`](#prometheusflush_expired) yourself,
@@ -263,7 +268,16 @@ reclaim from a single process, or on your own schedule.
 The reclamation is issued in batches, because the underlying
 `ngx.shared.DICT:flush_expired()` holds the dict lock until it returns: a
 bounded number of entries is reclaimed per call, and the other workers get the
-lock back in between.
+lock back in between. Note that the batch bounds only the freeing, not the
+walk: that call scans the whole LRU queue and stops early only once the batch
+has been freed, so every call pays for the scan again. The batch is therefore
+sized so that a normal round -- the expiry rate times
+`remove_expired_keys_interval` -- is drained in a single call, and a backlog
+larger than one round is spread over several, at most 500000 entries and 10
+seconds per round. What is left over is picked up by the next round.
+
+Overlapping rounds are refused: a call that arrives while one is still running
+reclaims nothing and returns 0.
 
 ### counter:inc()
 
