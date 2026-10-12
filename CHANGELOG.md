@@ -6,12 +6,13 @@ of changes.
 
 ## Unreleased
 
-- **Changed the default `remove_expired_keys_interval` from 3600 to 60
-  seconds**, and removed its upper bound. At 3600s an expiry rate of only ~44
-  series/s fills a default-sized dict with dead entries, after which creating a
-  new series force-evicts live metrics (apache/apisix#13658); running the
-  reclamation every 60s costs ~0.4s of dict lock time per hour per worker
-  (#23).
+- **Changed the default `remove_expired_keys_interval` from 3600 to 1800
+  seconds**, and removed its upper bound. At 3600s an expiry rate of 17-58
+  series/s, depending on how much of the dict is live, fills a default-sized
+  dict with dead entries, after which creating a new series force-evicts live
+  metrics (apache/apisix#13658). Halving the interval doubles the rate that is
+  tolerated while keeping the reclamation rare enough that a returning metric
+  usually still finds its entry and keeps its slot number (#23).
 - Bound the work one round of `remove_expired_keys()` does, and spread the
   per-worker timers over the interval instead of firing them all at
   `init_worker`. Asking the dict for a slot's ttl is a lock acquisition, and

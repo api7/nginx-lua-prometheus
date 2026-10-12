@@ -110,24 +110,47 @@ local DEFAULT_SYNC_INTERVAL = 1
 --   450,000           521,184    71,184   -- 28,816 live metrics destroyed
 --   700,000           521,184    0        -- all of them
 --
--- At 3600s that bound is reached by an expiry rate of ~44 series/s, which is
--- ordinary for a gateway with an exptime configured; this is the shape of
--- apache/apisix#13658. At 60s it takes ~2,675 series/s.
+-- The expiry rate that bound tolerates, on a 128m dict:
 --
--- The soft bound is request latency. Same dict, 8 workers, a steady 20k rps,
--- one reclaim round in the middle:
+--   live entries   1800s          3600s         60s
+--   100,000        117 series/s   58 series/s   3,508 series/s
+--   200,000         89 series/s   45 series/s   2,675 series/s
+--   400,000         34 series/s   17 series/s   1,069 series/s
+--
+-- 3600s is what this library used to default to, and 17-58 series/s is ordinary
+-- for a gateway with an exptime configured: this is the shape of
+-- apache/apisix#13658.
+--
+-- The soft bound is request latency, and it turns out to be the weaker of the
+-- two. Same dict, 8 workers, a steady 20k rps, one reclaim round in the middle:
 --
 --   backlog    calls   one hold   p99      p99.9     max
 --   none       -       -          2.02ms   2.32ms    4.52ms
 --   12,000     1       4.3ms      2.03ms   2.33ms    5.97ms
 --   60,000     2       15.1ms     2.20ms   7.64ms    22.67ms
 --   240,000    5       24.8ms     7.13ms   14.94ms   26.29ms
+--   350,000    8       15.2ms     2.13ms   10.09ms   16.91ms
 --
--- A backlog of ~12,000 entries is indistinguishable from not reclaiming at all;
--- past that the tail starts to move. 60s keeps a round inside that zone for
--- expiry rates up to ~100 series/s.
+-- Even a backlog that fills two thirds of the dict costs ~10ms at p99.9, so
+-- what a long interval risks is the memory, not the requests.
 --
--- Running often has to be cheap for any of this to hold, and it is only cheap
+-- Pulling the other way is that reclaiming is also what gives up slot numbers.
+-- A metric whose entry is still in the dict comes back on its own number; one
+-- whose entry has been reclaimed has to take a new one. Measured over rounds of
+-- 3000 series expiring and being observed again:
+--
+--   interval   new slot numbers per round
+--   3600s      879 on average, and the last rounds 9, 8, 4, 3 -- it converges
+--   60s        2003 -- all of them, every round
+--
+-- So a short interval trades slot numbers for memory headroom, and 1800s is
+-- picked to keep both: it halves the backlog 3600s accumulates while leaving
+-- the reclamation rare enough that a returning metric usually still finds its
+-- entry. Deployments whose churn is higher than the table above should lower
+-- it, and those whose metrics never expire can raise it freely -- there is no
+-- upper bound.
+--
+-- None of this would hold if a round were expensive, and it is only cheap
 -- because a round does bounded work: both the reclamation and the local scan
 -- are sliced (see FLUSH_EXPIRED_BATCH and REMOVE_EXPIRED_KEYS_SCAN_SLOTS), and
 -- the per-worker timers are spread over the interval instead of all firing at
@@ -140,12 +163,7 @@ local DEFAULT_SYNC_INTERVAL = 1
 --   20s,  unbounded round               280.32ms 473.86ms 568.32ms
 --   60s,  bounded round                 2.04ms   2.81ms   27.45ms
 --   20s,  bounded round                 2.07ms   4.36ms   27.76ms
---
--- With the round bounded, 60s is indistinguishable from not reclaiming at all,
--- and it also lets the local scan finish a full sweep in minutes rather than
--- days. Being too frequent then costs almost nothing, while being too rare
--- destroys live metrics -- which is what settles the choice.
-local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 60
+local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 1800
 
 -- Shortest interval accepted: a round may occupy its timer for
 -- FLUSH_EXPIRED_MAX_BATCHES * FLUSH_EXPIRED_BATCH_DELAY seconds and must not

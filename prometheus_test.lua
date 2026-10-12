@@ -240,9 +240,9 @@ function TestPrometheus:testInitBoundsTheRemoveExpiredKeysInterval()
 
   -- the default applies to both forms of the second argument
   local p3 = require('prometheus').init("metrics", {})
-  assert(p3.remove_expired_keys_interval == 60)
+  assert(p3.remove_expired_keys_interval == 1800)
   local p4 = require('prometheus').init("metrics", "pref_")
-  assert(p4.remove_expired_keys_interval == 60)
+  assert(p4.remove_expired_keys_interval == 1800)
 
   luaunit.assertEquals(ngx.logs, nil)
 end
