@@ -207,12 +207,14 @@ end
 -- The batch loop itself, so that the public entry point below can guard it.
 local function flush_expired_batches(self)
   local total = 0
-  for _ = 1, FLUSH_EXPIRED_MAX_BATCHES do
+  for batch = 1, FLUSH_EXPIRED_MAX_BATCHES do
     local freed = self.dict:flush_expired(FLUSH_EXPIRED_BATCH)
     total = total + freed
     -- freeing less than a full batch means this call has already walked the
-    -- whole queue, so there is nothing left to reclaim
-    if freed < FLUSH_EXPIRED_BATCH then
+    -- whole queue, so there is nothing left to reclaim. The pause belongs
+    -- between two batches, so there is none after the last one either -- it
+    -- would just hold up the timer for a round that is already over.
+    if freed < FLUSH_EXPIRED_BATCH or batch == FLUSH_EXPIRED_MAX_BATCHES then
       break
     end
 

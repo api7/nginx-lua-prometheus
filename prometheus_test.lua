@@ -980,11 +980,16 @@ function TestKeyIndex:testFlushExpiredRunsInBatches()
     batches[#batches + 1] = n
     return flush_expired(dict, n)
   end
+  local slept = 0
+  ngx.sleep = function() slept = slept + 1 end
 
   -- the backlog is one entry past a batch, so reaching all of it takes a
   -- second call, which then comes back short
   luaunit.assertEquals(self.key_index:flush_expired(), expired)
   luaunit.assertEquals(batches, {batch, batch})
+  -- the pause belongs between two batches, so there is one fewer of them
+  luaunit.assertEquals(slept, #batches - 1)
+  ngx.sleep = nil
 
   -- nothing left: the loop must stop after the call that comes back short
   batches = {}
