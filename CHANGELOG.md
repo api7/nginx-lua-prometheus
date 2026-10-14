@@ -4,6 +4,15 @@ This file only calls out major changes. Please see [the list of Git commits](
 https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
 
+## Unreleased
+
+- Register a metric in the key index once, when its value is created, instead
+  of renewing its slot on every observation. Only the processes that list the
+  metrics keep a copy of the index, and they give a slot back once its value is
+  gone; the other workers keep no index and no reclaim timer work. With 200,000
+  expiring series across 10 workers, a writer worker's Lua heap drops from
+  ~24MB to ~1.5MB and the every-worker reclaim stalls are gone.
+
 ## 1.0.0
 
 Starting with this release, this fork (`nginx-lua-prometheus-api7`) uses

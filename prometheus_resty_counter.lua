@@ -35,7 +35,19 @@ local function sync(_, self)
   local ok = true
   for k, value in pairs(self.increments) do
     local v = value.v
-    _, err, forcible = self.dict:incr(k, v, 0)
+    local created = false
+    _, err, forcible = self.dict:incr(k, v)
+    if err == "not found" then
+      -- add() rather than incr() with an init value, so that exactly one
+      -- worker learns it has created the value and registers it
+      local added
+      added, err, forcible = self.dict:add(k, v, value.t)
+      if added then
+        created = true
+      elseif err == "exists" then
+        _, err, forcible = self.dict:incr(k, v)
+      end
+    end
     if forcible then
       ngx.log(ngx.ERR, "increasing counter in shdict: lru eviction: key=", k)
       ok = false
@@ -44,7 +56,11 @@ local function sync(_, self)
       ngx.log(ngx.ERR, "error increasing counter in shdict key: ", k, ", err: ", err)
       ok = false
     end
-    if value.t then
+    if created then
+      if self.on_create then
+        self.on_create(k)
+      end
+    elseif value.t then
       self.dict:expire(k, value.t)
     end
   end
@@ -57,7 +73,9 @@ local function sync(_, self)
   return ok
 end
 
-function _M.new(shdict_name, sync_interval, error_metric_name)
+-- on_create, if given, is called with the key of every value this worker
+-- creates in the dict when it syncs.
+function _M.new(shdict_name, sync_interval, error_metric_name, on_create)
   id = ngx.worker.id()
 
   if not ngx_shared[shdict_name] then
@@ -72,6 +90,7 @@ function _M.new(shdict_name, sync_interval, error_metric_name)
     dict = ngx_shared[shdict_name],
     increments = increments[shdict_name],
     error_metric_name = error_metric_name,
+    on_create = on_create,
   }, mt)
 
   if sync_interval then
