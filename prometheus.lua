@@ -92,8 +92,90 @@ local DEFAULT_ERROR_METRIC_NAME = "nginx_metric_errors_total"
 -- Default value for per-worker counter sync interval (seconds).
 local DEFAULT_SYNC_INTERVAL = 1
 
--- Max value for check and remove expired keys interval (seconds).
-local MAX_REMOVE_EXPIRED_KEYS_INTERVAL = 3600
+-- Default interval, in seconds, between two rounds of dropping expired metrics
+-- and reclaiming the dict entries they left behind.
+--
+-- The interval has one observable consequence: how much backlog a round has to
+-- reclaim, which is the expiry rate times the interval times two (a value key
+-- and an index slot per series). Both bounds on it come from that.
+--
+-- The hard bound is the dict: once the backlog no longer fits beside the live
+-- entries, the writes that create new series start force-evicting live ones,
+-- and the dead entries win because they were written last. Measured on a 128m
+-- dict (521,184 entries of a typical shape) holding 100,000 live entries:
+--
+--   backlog written   entries    live entries left after reclaiming
+--   120,000           220,000    100,000
+--   350,000           450,000    100,000
+--   450,000           521,184    71,184   -- 28,816 live metrics destroyed
+--   700,000           521,184    0        -- all of them
+--
+-- The expiry rate that bound tolerates, on a 128m dict:
+--
+--   live entries   1800s          3600s         60s
+--   100,000        117 series/s   58 series/s   3,508 series/s
+--   200,000         89 series/s   45 series/s   2,675 series/s
+--   400,000         34 series/s   17 series/s   1,069 series/s
+--
+-- 3600s is what this library used to default to, and 17-58 series/s is ordinary
+-- for a gateway with an exptime configured: this is the shape of
+-- apache/apisix#13658.
+--
+-- The soft bound is request latency, and it turns out to be the weaker of the
+-- two. Same dict, 8 workers, a steady 20k rps, one reclaim round in the middle:
+--
+--   backlog    calls   one hold   p99      p99.9     max
+--   none       -       -          2.02ms   2.32ms    4.52ms
+--   12,000     1       4.3ms      2.03ms   2.33ms    5.97ms
+--   60,000     2       15.1ms     2.20ms   7.64ms    22.67ms
+--   240,000    5       24.8ms     7.13ms   14.94ms   26.29ms
+--   350,000    8       15.2ms     2.13ms   10.09ms   16.91ms
+--
+-- Even a backlog that fills two thirds of the dict costs ~10ms at p99.9, so
+-- what a long interval risks is the memory, not the requests.
+--
+-- Pulling the other way is that reclaiming is also what gives up slot numbers.
+-- A metric whose entry is still in the dict comes back on its own number; one
+-- whose entry has been reclaimed has to take a new one. Measured over rounds of
+-- 3000 series expiring and being observed again:
+--
+--   interval   new slot numbers per round
+--   3600s      879 on average, and the last rounds 9, 8, 4, 3 -- it converges
+--   60s        2003 -- all of them, every round
+--
+-- So a short interval trades slot numbers for memory headroom, and 1800s is
+-- picked to keep both: it halves the backlog 3600s accumulates while leaving
+-- the reclamation rare enough that a returning metric usually still finds its
+-- entry. Deployments whose churn is higher than the table above should lower
+-- it, and those whose metrics never expire can raise it freely -- there is no
+-- upper bound.
+--
+-- None of this would hold if a round were expensive, and it is only cheap
+-- because a round does bounded work: the reclamation is batched and the local
+-- scan yields (see FLUSH_EXPIRED_BATCH and REMOVE_EXPIRED_KEYS_YIELD_EVERY), and
+-- the per-worker timers are spread over the interval instead of all firing at
+-- init_worker. Measured with 150,000 expiring series of which none actually
+-- expires during the run, so every round is empty:
+--
+--   interval   p99      p99.9     max
+--   600s (no round fired, the control)   2.02ms   2.38ms   9.93ms
+--   60s,  unbounded round               2.30ms   418.30ms 533.50ms
+--   20s,  unbounded round               280.32ms 473.86ms 568.32ms
+--   60s,  bounded round                 2.04ms   2.81ms   27.45ms
+--   20s,  bounded round                 2.07ms   4.36ms   27.76ms
+local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 1800
+
+-- Shortest interval accepted: a round may occupy its timer for
+-- FLUSH_EXPIRED_MAX_BATCHES * FLUSH_EXPIRED_BATCH_DELAY seconds and must not
+-- take more than half of its own interval. Overlapping rounds are refused
+-- rather than run, so a shorter interval would only drop rounds silently.
+local MIN_REMOVE_EXPIRED_KEYS_INTERVAL =
+  key_index_lib.FLUSH_EXPIRED_MAX_BATCHES *
+  key_index_lib.FLUSH_EXPIRED_BATCH_DELAY * 2
+
+-- There is deliberately no upper bound: how long an interval a deployment can
+-- afford follows from its dict size and expiry rate, which only the caller
+-- knows.
 
 -- Default max size of lookup table
 local DEFAULT_LOOKUP_MAX_SIZE = 1000
@@ -742,20 +824,28 @@ function Prometheus.init(dict_name, options_or_prefix)
       DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = options_or_prefix.lookup_max_size or
       DEFAULT_LOOKUP_MAX_SIZE
-    self.remove_expired_keys_interval = options_or_prefix.remove_expired_keys_interval
-        and options_or_prefix.remove_expired_keys_interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-        and options_or_prefix.remove_expired_keys_interval
-      or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+    local interval = options_or_prefix.remove_expired_keys_interval
+    if interval and interval < MIN_REMOVE_EXPIRED_KEYS_INTERVAL then
+      ngx.log(ngx.WARN, "remove_expired_keys_interval of ", interval,
+              "s is shorter than the minimum of ",
+              MIN_REMOVE_EXPIRED_KEYS_INTERVAL, "s, using the minimum")
+      interval = MIN_REMOVE_EXPIRED_KEYS_INTERVAL
+    end
+    self.remove_expired_keys_interval =
+      interval or DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.auto_flush_expired = options_or_prefix.auto_flush_expired ~= false
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
-    self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.remove_expired_keys_interval = DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.auto_flush_expired = true
   end
 
   self.registry = {}
-  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX, self.remove_expired_keys_interval)
+  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
+    self.remove_expired_keys_interval, self.auto_flush_expired)
 
   self.initialized = true
 
@@ -930,6 +1020,20 @@ end
 -- Returns:
 --   Array of strings with all metrics in a text format compatible with
 --   Prometheus.
+-- Reclaims the expired entries of the metrics shared dict, in batches, and
+-- returns how many were reclaimed.
+--
+-- Only needed by callers that set auto_flush_expired to false and schedule the
+-- reclamation themselves, in a single process instead of in every worker.
+function Prometheus:flush_expired()
+  if not self.initialized then
+    ngx.log(ngx.ERR, "Prometheus module has not been initialized")
+    return 0
+  end
+
+  return self.key_index:flush_expired()
+end
+
 function Prometheus:metric_data()
   if not self.initialized then
     ngx.log(ngx.ERR, "Prometheus module has not been initialized")

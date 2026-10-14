@@ -14,6 +14,66 @@ KeyIndex.__index = KeyIndex
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
 
+-- Entries a single flush_expired() call may reclaim.
+--
+-- flush_expired(n) walks the LRU queue from its tail and only stops early once
+-- n entries have been freed, so one call costs
+--
+--   walk_cost * entries in the dict  +  free_cost * entries freed
+--
+-- and only the second term is bounded by n: every call pays the walk again
+-- (measured on OpenResty 1.29.2.4: ~7.5ns and ~90-148ns per entry). A small
+-- batch therefore barely shortens a single hold -- it multiplies the walk, and
+-- with it the total time the lock is held and the number of requests that wait
+-- on it. Reclaiming a 1.5M backlog out of 3M entries took 151 calls and 1771ms
+-- of lock time at n=10000 and pushed the request p99 to 1.53s, against a single
+-- 151ms hold and a p99 of 2.19ms unbounded.
+--
+-- So n is the largest value whose own freeing cost still keeps one hold short
+-- (~5ms here). A normal round -- the expiry rate times the reclaim interval --
+-- is drained in one call, and the batching only comes into play for a backlog
+-- that is not.
+local FLUSH_EXPIRED_BATCH = 50000
+
+-- Upper bound on the batches one round may run, so a backlog that is not normal
+-- -- inherited across an upgrade, or left by a dict that filled up with expired
+-- entries -- is drained over several rounds instead of one long stretch. What is
+-- left over is picked up by the next round.
+local FLUSH_EXPIRED_MAX_BATCHES = 10
+
+-- Pause between batches, so the lock is not taken back to back. It also bounds
+-- how long one round can occupy its timer: FLUSH_EXPIRED_MAX_BATCHES times this.
+local FLUSH_EXPIRED_BATCH_DELAY = 1
+
+-- Slots the local scan of remove_expired_keys() asks the dict about between two
+-- yields.
+--
+-- Asking the dict for a slot's ttl is a lock acquisition, and doing it for
+-- every slot the worker knows has one is what a round used to cost: with
+-- 150,000 such slots across 8 workers and a steady 20k rps it showed up as a
+-- ~480ms stall at p99.9, of which the reclamation itself was 5%. With 200,000
+-- slots and 10 workers whose rounds fire together it was a ~1s stall of every
+-- worker at once, all of them spinning on the dict lock.
+--
+-- Two things bound it now. The scan skips any slot whose recorded deadline has
+-- not passed, without touching the dict, so the lock acquisitions are
+-- proportional to what has actually lapsed rather than to the index. And it
+-- yields after every this many of them, so a round where everything has lapsed
+-- still keeps the worker's event loop running: ~0.2ms of work between two
+-- yields. Each round still covers every lapsed slot, so the worker-local index
+-- cannot fall behind the rate the metrics expire at.
+local REMOVE_EXPIRED_KEYS_YIELD_EVERY = 500
+
+
+-- Exposed so a caller that schedules the reclamation itself can reason about it:
+-- one round drains at most FLUSH_EXPIRED_BATCH * FLUSH_EXPIRED_MAX_BATCHES
+-- entries and may occupy its timer for FLUSH_EXPIRED_MAX_BATCHES *
+-- FLUSH_EXPIRED_BATCH_DELAY seconds.
+KeyIndex.FLUSH_EXPIRED_BATCH = FLUSH_EXPIRED_BATCH
+KeyIndex.FLUSH_EXPIRED_MAX_BATCHES = FLUSH_EXPIRED_MAX_BATCHES
+KeyIndex.FLUSH_EXPIRED_BATCH_DELAY = FLUSH_EXPIRED_BATCH_DELAY
+KeyIndex.REMOVE_EXPIRED_KEYS_YIELD_EVERY = REMOVE_EXPIRED_KEYS_YIELD_EVERY
+
 
 -- check and remove expired keys
 local function remove_expired_keys(_, self)
@@ -21,9 +81,38 @@ local function remove_expired_keys(_, self)
 end
 
 
-function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
+-- Every worker runs init_worker at the same moment, so a plain ngx.timer.every
+-- would have all of them reclaim at the same moment too and their stalls would
+-- add up. Spread the first round evenly over the interval instead, by worker
+-- id, and only then settle into the interval.
+local function start_remove_expired_keys_timer(self, interval)
+  local id = tonumber(ngx.worker.id()) or 0
+  local count = ngx.worker.count and tonumber(ngx.worker.count()) or 1
+  if id < 0 or not count or count < 1 then
+    id, count = 0, 1
+  end
+
+  local offset = interval * id / count
+  if offset <= 0 then
+    ngx.timer.every(interval, remove_expired_keys, self)
+    return
+  end
+
+  ngx.timer.at(offset, function(premature, s)
+    if premature then
+      return
+    end
+    ngx.timer.every(interval, remove_expired_keys, s)
+    s:remove_expired_keys()
+  end, self)
+end
+
+
+function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
+                      auto_flush_expired)
   local self = setmetatable({}, KeyIndex)
   self.dict = shared_dict
+  self.auto_flush_expired = auto_flush_expired ~= false
   self.key_prefix = prefix .. "key_"
   self.delete_count = prefix .. "delete_count"
   self.key_count = prefix .. "key_count"
@@ -34,37 +123,162 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.index = {}
   self.expire_keys = {}
 
-  ngx.timer.every(remove_expired_keys_interval or 600, remove_expired_keys, self)
+  start_remove_expired_keys_timer(self, remove_expired_keys_interval or 600)
   return self
 end
 
--- check and remove expired keys
-function KeyIndex:remove_expired_keys()
-  for i, _ in pairs(self.expire_keys) do
-    -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
-    local ttl, err = self.dict:ttl(self.key_prefix .. i)
-    if not (ttl and ttl >= 0 or err and err ~= "not found") then
-      if self.keys[i] then
-        self.index[self.keys[i]] = nil
-        self.keys[i] = nil
-      end
-      self.expire_keys[i] = nil
+-- Drops the worker-local references to the slots that have expired.
+local function remove_expired_slots(self)
+  -- self.expire_keys[i] is when this worker last saw slot i expire. While
+  -- that is still in the future the slot was there and nothing but a forced
+  -- eviction can have taken it, so there is nothing to ask the dict -- which
+  -- is what makes a round cost nothing when nothing has lapsed. Should a
+  -- forced eviction have taken it anyway, the only consequence is a local
+  -- reference that outlives its slot, and add() drops it on the next
+  -- observation of that key.
+  --
+  -- The lapsed slots are collected first, in plain Lua: the scan below yields,
+  -- and a pairs() traversal must not span a yield, during which add() may
+  -- insert into self.expire_keys.
+  local now = ngx.now()
+  local due, n = {}, 0
+  for i, deadline in pairs(self.expire_keys) do
+    if deadline <= now then
+      n = n + 1
+      due[n] = i
     end
   end
 
-  -- The loop above only drops worker-local references. The expired shared-dict
-  -- entries themselves (both the __ngx_prom__key_N index slots and the metric
-  -- value keys, which live in the same dict) are only *logically* dead: every
-  -- dict API treats them as missing, but their slab pages stay allocated. The
-  -- passive per-write expiry scan cannot reclaim them either, because it stops
-  -- at the first non-expired entry at the LRU tail, and a permanent entry (the
-  -- error metric, or any metric registered without an exptime) inevitably ends
-  -- up sitting there. Without this call the dict grows without bound under
-  -- label churn: index slots are never reused, so free_space steps down on
-  -- every new series and never recovers (apache/apisix#13658). Since expired
-  -- entries are indistinguishable from absent ones through every dict API,
-  -- reclaiming them here cannot change any observable behaviour.
-  self.dict:flush_expired()
+  for j = 1, n do
+    if j > 1 and (j - 1) % REMOVE_EXPIRED_KEYS_YIELD_EVERY == 0 then
+      ngx.sleep(0)
+      -- do not hold up a reload: what is left is gone with the worker anyway
+      if ngx.worker.exiting() then
+        return
+      end
+      now = ngx.now()
+    end
+
+    -- re-read: while this round yielded the slot may have been renewed, or
+    -- dropped by add()
+    local i = due[j]
+    local deadline = self.expire_keys[i]
+    if deadline and deadline <= now then
+      -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
+      local ttl, err = self.dict:ttl(self.key_prefix .. i)
+      if not (ttl and ttl >= 0 or err and err ~= "not found") then
+        local key = self.keys[i]
+        -- the key may have moved to another slot meanwhile; that mapping is
+        -- live and is not this slot's to drop
+        if key and self.index[key] == i then
+          self.index[key] = nil
+        end
+        self.keys[i] = nil
+        self.expire_keys[i] = nil
+      else
+        -- still there: another worker renewed it, so wait out the new ttl
+        -- instead of asking again every round
+        self.expire_keys[i] = now + ttl
+      end
+    end
+  end
+end
+
+
+-- check and remove expired keys
+function KeyIndex:remove_expired_keys()
+  -- A round yields, so the timer can fire again before the previous run
+  -- finished (ngx.timer.every does not wait for it). Two rounds would only ask
+  -- the dict about the same slots twice, so the second one steps aside.
+  if self.removing then
+    return
+  end
+
+  self.removing = true
+  -- pcall so that a throwing ngx.sleep -- a caller reaching this from a phase
+  -- that does not allow yielding -- cannot leave the guard set and stop the
+  -- local scan for the life of the worker.
+  local ok, err = pcall(remove_expired_slots, self)
+  self.removing = false
+
+  if not ok then
+    ngx.log(ngx.ERR, "failed to remove expired keys: ", tostring(err))
+  end
+
+  -- The scan above only drops worker-local references, so the expired entries
+  -- still have to be reclaimed from the dict itself. Callers that schedule
+  -- flush_expired() themselves -- in a single process rather than in every
+  -- worker -- turn this off with auto_flush_expired.
+  if self.auto_flush_expired then
+    self:flush_expired()
+  end
+end
+
+
+-- Reclaims the expired entries of the shared dict, in batches.
+--
+-- The expired entries (both the __ngx_prom__key_N index slots and the metric
+-- value keys, which live in the same dict) are only *logically* dead: every
+-- dict API treats them as missing, but their slab pages stay allocated. The
+-- passive per-write expiry scan cannot reclaim them either, because it stops
+-- at the first non-expired entry at the LRU tail, and a permanent entry (the
+-- error metric, or any metric registered without an exptime) inevitably ends
+-- up sitting there. Without this the dict grows without bound under label
+-- churn: index slots are never reused, so free_space steps down on every new
+-- series and never recovers (apache/apisix#13658). Since expired entries are
+-- indistinguishable from absent ones through every dict API, reclaiming them
+-- cannot change any observable behaviour.
+--
+-- flush_expired() holds the dict lock for its whole scan of the LRU queue, so
+-- it is called with a batch size: a bounded number of entries is reclaimed per
+-- call, and the workers get the lock back in between.
+--
+-- Returns the number of entries reclaimed.
+--
+-- The batch loop itself, so that the public entry point below can guard it.
+local function flush_expired_batches(self)
+  local total = 0
+  for batch = 1, FLUSH_EXPIRED_MAX_BATCHES do
+    local freed = self.dict:flush_expired(FLUSH_EXPIRED_BATCH)
+    total = total + freed
+    -- freeing less than a full batch means this call has already walked the
+    -- whole queue, so there is nothing left to reclaim. The pause belongs
+    -- between two batches, so there is none after the last one either -- it
+    -- would just hold up the timer for a round that is already over.
+    if freed < FLUSH_EXPIRED_BATCH or batch == FLUSH_EXPIRED_MAX_BATCHES then
+      break
+    end
+
+    ngx.sleep(FLUSH_EXPIRED_BATCH_DELAY)
+  end
+
+  return total
+end
+
+
+function KeyIndex:flush_expired()
+  -- A round yields between batches, so the timer can fire again before the
+  -- previous run finished (ngx.timer.every does not wait for it), and a caller
+  -- scheduling its own round can overlap with it too. Two rounds racing for the
+  -- dict lock double the stall and reclaim nothing extra, so the second one
+  -- steps aside.
+  if self.flushing then
+    return 0
+  end
+
+  self.flushing = true
+  -- pcall so that a throwing ngx.sleep -- a caller reaching this from a phase
+  -- that does not allow yielding -- cannot leave the guard set and stop the
+  -- reclamation for the life of the worker.
+  local ok, total = pcall(flush_expired_batches, self)
+  self.flushing = false
+
+  if not ok then
+    ngx.log(ngx.ERR, "failed to reclaim expired entries: ", tostring(total))
+    return 0
+  end
+
+  return total
 end
 
 -- Loads new keys that might have been added by other workers since last sync.
@@ -91,11 +305,11 @@ function KeyIndex:sync_range(first, last)
       self.keys[i] = key
       self.index[key] = i
 
-      -- if it is nil and ttl not is 0, set expire_keys map
+      -- if it is nil and ttl not is 0, record when the slot expires
       if not self.expire_keys[i] then
         local ttl, _ = self.dict:ttl(self.key_prefix .. i)
         if ttl and ttl ~= 0 then
-          self.expire_keys[i] = true
+          self.expire_keys[i] = ngx.now() + ttl
         end
       end
     elseif self.keys[i] then
@@ -143,6 +357,10 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     keys = { key_or_keys }
   end
 
+  -- when the slot's expiry is renewed or set below, remember when it lands, so
+  -- that remove_expired_keys() does not have to ask the dict about it
+  local now = exptime and exptime > 0 and ngx.now()
+
   for _, key in pairs(keys) do
     local retried = false
     local repairs = 0
@@ -154,6 +372,9 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         local expired = false
         if exptime then
           local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
+          if ok and now then
+            self.expire_keys[self.index[key]] = now + exptime
+          end
           if not ok then
             if err == "not found" then
               -- The slot already expired in the shared dict. Drop the stale
@@ -199,8 +420,8 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
         self.keys[N] = key
         self.index[key] = N
-        if exptime and exptime > 0 then
-          self.expire_keys[N] = true
+        if now then
+          self.expire_keys[N] = now + exptime
         end
         if forcible or forcible2 or repair_forcible then
           return (err_msg_lru_eviction .. "; key index: add key: idx=" ..
