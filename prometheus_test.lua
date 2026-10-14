@@ -123,6 +123,9 @@ Nginx.worker = {}
 function Nginx.worker.id()
   return 'testworker'
 end
+function Nginx.worker.exiting()
+  return false
+end
 function Nginx.sleep() end
 function Nginx.now()
   -- the SimpleDict mock keeps expiry in os.time() units
@@ -1027,13 +1030,13 @@ function TestKeyIndex:testRemoveExpiredKeysSkipsSlotsThatCannotHaveLapsed()
 end
 
 -- The slots whose deadline has passed do have to be asked about, and there can
--- be as many of them as the index is large, so the scan walks a bounded slice
--- per round and resumes where the previous round stopped.
-function TestKeyIndex:testRemoveExpiredKeysScansASlicePerRound()
-  local slice = self.key_index.REMOVE_EXPIRED_KEYS_SCAN_SLOTS
+-- be as many of them as the index is large. One round asks about all of them,
+-- so the local index keeps up with the expiry rate, but yields every
+-- REMOVE_EXPIRED_KEYS_YIELD_EVERY of them so the worker keeps serving.
+local function lapse_all_slots(self, prefix, count)
   local keys = {}
-  for i = 1, slice + 10 do
-    keys[i] = "sliced_" .. i
+  for i = 1, count do
+    keys[i] = prefix .. i
   end
   luaunit.assertEquals(self.key_index:add(keys, "eviction_err", 600), nil)
 
@@ -1043,34 +1046,106 @@ function TestKeyIndex:testRemoveExpiredKeysScansASlicePerRound()
     self.key_index.expire_keys[i] = 0
   end
 
-  local checked = 0
+  local counter = {checked = 0}
   local ttl = SimpleDict.ttl
   self.dict.ttl = function(dict, k)
-    checked = checked + 1
+    counter.checked = counter.checked + 1
     return ttl(dict, k)
   end
+  return counter
+end
 
-  self.key_index:remove_expired_keys()
-  local first = checked
-  luaunit.assertTrue(first <= slice)
-  -- it really did stop short of the whole range
-  luaunit.assertTrue(first < slice + 10)
+function TestKeyIndex:testRemoveExpiredKeysYieldsWhileScanning()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "yield_", 2 * every + 10)
 
-  checked = 0
+  local yields, checked_at_yield = 0, {}
+  ngx.sleep = function()
+    yields = yields + 1
+    checked_at_yield[yields] = counter.checked
+  end
   self.key_index:remove_expired_keys()
-  -- the next round picks up the rest, and each slot is asked about once
-  luaunit.assertEquals(first + checked, slice + 10)
+  ngx.sleep = nil
+
+  -- every lapsed slot is asked about in this one round, in steps of `every`
+  luaunit.assertEquals(counter.checked, 2 * every + 10)
+  luaunit.assertEquals(checked_at_yield, {every, 2 * every})
 
   -- the slots are all still live, so they are kept, and their deadlines are
   -- refreshed rather than re-checked on every round from now on
-  luaunit.assertEquals(self.key_index.index["sliced_1"], 1)
-  luaunit.assertEquals(self.key_index.index["sliced_" .. (slice + 10)], slice + 10)
-  checked = 0
+  luaunit.assertEquals(self.key_index.index["yield_1"], 1)
+  luaunit.assertEquals(self.key_index.index["yield_" .. (2 * every + 10)],
+                       2 * every + 10)
+  counter.checked = 0
   self.key_index:remove_expired_keys()
-  luaunit.assertEquals(checked, 0)
+  luaunit.assertEquals(counter.checked, 0)
 
   self.dict.ttl = nil
   luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A round yields, so the timer can fire again before it finishes. The second
+-- round must step aside instead of asking the dict about the same slots again.
+function TestKeyIndex:testRemoveExpiredKeysDoesNotOverlap()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "overlap_", every + 10)
+
+  local checked_by_reentry
+  ngx.sleep = function()
+    if checked_by_reentry == nil then
+      local before = counter.checked
+      self.key_index:remove_expired_keys()
+      checked_by_reentry = counter.checked - before
+    end
+  end
+  self.key_index:remove_expired_keys()
+  ngx.sleep = nil
+
+  luaunit.assertEquals(checked_by_reentry, 0)
+  luaunit.assertEquals(counter.checked, every + 10)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A worker that is shutting down stops scanning at the next yield, so it does
+-- not hold up a reload.
+function TestKeyIndex:testRemoveExpiredKeysStopsWhenExiting()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "exiting_", every + 10)
+
+  ngx.worker.exiting = function() return true end
+  self.key_index:remove_expired_keys()
+  ngx.worker.exiting = function() return false end
+
+  luaunit.assertEquals(counter.checked, every)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A throwing ngx.sleep -- a caller reaching remove_expired_keys() from a phase
+-- that does not allow yielding -- must not leave the guard set, or the worker
+-- would stop scanning for good.
+function TestKeyIndex:testRemoveExpiredKeysReleasesTheGuardAfterAnError()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "error_", every + 10)
+
+  ngx.sleep = function() error("API disabled in the current context") end
+  self.key_index:remove_expired_keys()
+  ngx.sleep = nil
+
+  luaunit.assertEquals(#ngx.logs, 1)
+  luaunit.assertStrContains(ngx.logs[1], "failed to remove expired keys")
+  ngx.logs = nil
+  luaunit.assertEquals(counter.checked, every)
+
+  -- the guard is released, so the next round asks about the rest
+  counter.checked = 0
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(counter.checked, 10)
+
+  self.dict.ttl = nil
 end
 
 -- One round yields between batches, so the timer can fire again before it

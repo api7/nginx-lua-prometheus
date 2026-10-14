@@ -45,25 +45,24 @@ local FLUSH_EXPIRED_MAX_BATCHES = 10
 -- how long one round can occupy its timer: FLUSH_EXPIRED_MAX_BATCHES times this.
 local FLUSH_EXPIRED_BATCH_DELAY = 1
 
--- Slot numbers the local scan of remove_expired_keys() may walk in one round.
+-- Slots the local scan of remove_expired_keys() asks the dict about between two
+-- yields.
 --
 -- Asking the dict for a slot's ttl is a lock acquisition, and doing it for
 -- every slot the worker knows has one is what a round used to cost: with
 -- 150,000 such slots across 8 workers and a steady 20k rps it showed up as a
--- ~480ms stall at p99.9, of which the reclamation itself was 5%. A tenth of the
--- slots made it a ~40ms stall, so the cost was linear in them.
+-- ~480ms stall at p99.9, of which the reclamation itself was 5%. With 200,000
+-- slots and 10 workers whose rounds fire together it was a ~1s stall of every
+-- worker at once, all of them spinning on the dict lock.
 --
 -- Two things bound it now. The scan skips any slot whose recorded deadline has
 -- not passed, without touching the dict, so the lock acquisitions are
 -- proportional to what has actually lapsed rather than to the index. And it
--- walks only a slice of the slot range per round, resuming where the previous
--- round stopped, so even a round where everything has lapsed stays bounded.
---
--- A full sweep then takes key_count divided by this many rounds, which only
--- delays dropping the worker-local reference to a slot whose node is already
--- gone -- nothing reads it in the meantime, because every dict API reports that
--- slot as missing anyway.
-local REMOVE_EXPIRED_KEYS_SCAN_SLOTS = 10000
+-- yields after every this many of them, so a round where everything has lapsed
+-- still keeps the worker's event loop running: ~0.2ms of work between two
+-- yields. Each round still covers every lapsed slot, so the worker-local index
+-- cannot fall behind the rate the metrics expire at.
+local REMOVE_EXPIRED_KEYS_YIELD_EVERY = 500
 
 
 -- Exposed so a caller that schedules the reclamation itself can reason about it:
@@ -73,7 +72,7 @@ local REMOVE_EXPIRED_KEYS_SCAN_SLOTS = 10000
 KeyIndex.FLUSH_EXPIRED_BATCH = FLUSH_EXPIRED_BATCH
 KeyIndex.FLUSH_EXPIRED_MAX_BATCHES = FLUSH_EXPIRED_MAX_BATCHES
 KeyIndex.FLUSH_EXPIRED_BATCH_DELAY = FLUSH_EXPIRED_BATCH_DELAY
-KeyIndex.REMOVE_EXPIRED_KEYS_SCAN_SLOTS = REMOVE_EXPIRED_KEYS_SCAN_SLOTS
+KeyIndex.REMOVE_EXPIRED_KEYS_YIELD_EVERY = REMOVE_EXPIRED_KEYS_YIELD_EVERY
 
 
 -- check and remove expired keys
@@ -124,47 +123,57 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   self.index = {}
   self.expire_keys = {}
 
-  self.scan_cursor = 0
-
   start_remove_expired_keys_timer(self, remove_expired_keys_interval or 600)
   return self
 end
 
--- check and remove expired keys
-function KeyIndex:remove_expired_keys()
-  -- A slice of the slot range per round, resuming where the last round stopped,
-  -- so a round costs the same whatever the index has grown to. The range is
-  -- bounded by key_count rather than by self.last: a worker's own newest slots
-  -- are above the range it has synced, and they have to be scanned too.
-  local last = self.dict:get(self.key_count) or 0
-  local from = self.scan_cursor
-  if from > last then
-    from = 0
-  end
-  local to = from + REMOVE_EXPIRED_KEYS_SCAN_SLOTS - 1
-  if to > last then
-    to = last
-  end
-  self.scan_cursor = to + 1
-
+-- Drops the worker-local references to the slots that have expired.
+local function remove_expired_slots(self)
+  -- self.expire_keys[i] is when this worker last saw slot i expire. While
+  -- that is still in the future the slot was there and nothing but a forced
+  -- eviction can have taken it, so there is nothing to ask the dict -- which
+  -- is what makes a round cost nothing when nothing has lapsed. Should a
+  -- forced eviction have taken it anyway, the only consequence is a local
+  -- reference that outlives its slot, and add() drops it on the next
+  -- observation of that key.
+  --
+  -- The lapsed slots are collected first, in plain Lua: the scan below yields,
+  -- and a pairs() traversal must not span a yield, during which add() may
+  -- insert into self.expire_keys.
   local now = ngx.now()
-  for i = from, to do
-    -- self.expire_keys[i] is when this worker last saw slot i expire. While
-    -- that is still in the future the slot was there and nothing but a forced
-    -- eviction can have taken it, so there is nothing to ask the dict -- which
-    -- is what makes a round cost nothing when nothing has lapsed. Should a
-    -- forced eviction have taken it anyway, the only consequence is a local
-    -- reference that outlives its slot, and add() drops it on the next
-    -- observation of that key.
+  local due, n = {}, 0
+  for i, deadline in pairs(self.expire_keys) do
+    if deadline <= now then
+      n = n + 1
+      due[n] = i
+    end
+  end
+
+  for j = 1, n do
+    if j > 1 and (j - 1) % REMOVE_EXPIRED_KEYS_YIELD_EVERY == 0 then
+      ngx.sleep(0)
+      -- do not hold up a reload: what is left is gone with the worker anyway
+      if ngx.worker.exiting() then
+        return
+      end
+      now = ngx.now()
+    end
+
+    -- re-read: while this round yielded the slot may have been renewed, or
+    -- dropped by add()
+    local i = due[j]
     local deadline = self.expire_keys[i]
     if deadline and deadline <= now then
       -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
       local ttl, err = self.dict:ttl(self.key_prefix .. i)
       if not (ttl and ttl >= 0 or err and err ~= "not found") then
-        if self.keys[i] then
-          self.index[self.keys[i]] = nil
-          self.keys[i] = nil
+        local key = self.keys[i]
+        -- the key may have moved to another slot meanwhile; that mapping is
+        -- live and is not this slot's to drop
+        if key and self.index[key] == i then
+          self.index[key] = nil
         end
+        self.keys[i] = nil
         self.expire_keys[i] = nil
       else
         -- still there: another worker renewed it, so wait out the new ttl
@@ -173,8 +182,30 @@ function KeyIndex:remove_expired_keys()
       end
     end
   end
+end
 
-  -- The loop above only drops worker-local references, so the expired entries
+
+-- check and remove expired keys
+function KeyIndex:remove_expired_keys()
+  -- A round yields, so the timer can fire again before the previous run
+  -- finished (ngx.timer.every does not wait for it). Two rounds would only ask
+  -- the dict about the same slots twice, so the second one steps aside.
+  if self.removing then
+    return
+  end
+
+  self.removing = true
+  -- pcall so that a throwing ngx.sleep -- a caller reaching this from a phase
+  -- that does not allow yielding -- cannot leave the guard set and stop the
+  -- local scan for the life of the worker.
+  local ok, err = pcall(remove_expired_slots, self)
+  self.removing = false
+
+  if not ok then
+    ngx.log(ngx.ERR, "failed to remove expired keys: ", tostring(err))
+  end
+
+  -- The scan above only drops worker-local references, so the expired entries
   -- still have to be reclaimed from the dict itself. Callers that schedule
   -- flush_expired() themselves -- in a single process rather than in every
   -- worker -- turn this off with auto_flush_expired.

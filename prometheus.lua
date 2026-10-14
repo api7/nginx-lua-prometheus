@@ -151,8 +151,8 @@ local DEFAULT_SYNC_INTERVAL = 1
 -- upper bound.
 --
 -- None of this would hold if a round were expensive, and it is only cheap
--- because a round does bounded work: both the reclamation and the local scan
--- are sliced (see FLUSH_EXPIRED_BATCH and REMOVE_EXPIRED_KEYS_SCAN_SLOTS), and
+-- because a round does bounded work: the reclamation is batched and the local
+-- scan yields (see FLUSH_EXPIRED_BATCH and REMOVE_EXPIRED_KEYS_YIELD_EVERY), and
 -- the per-worker timers are spread over the interval instead of all firing at
 -- init_worker. Measured with 150,000 expiring series of which none actually
 -- expires during the run, so every round is empty:

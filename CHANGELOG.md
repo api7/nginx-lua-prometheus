@@ -18,9 +18,10 @@ of changes.
   `init_worker`. Asking the dict for a slot's ttl is a lock acquisition, and
   the scan did it for every slot the worker knew had one: with 150,000 of them
   across 8 workers that was a ~480ms stall at p99.9 on a steady 20k rps. It now
-  skips the slots whose recorded deadline has not passed and walks a bounded
-  slice of the rest, which brings the same case to 2.38ms -- the same as not
-  reclaiming at all (#23).
+  skips the slots whose recorded deadline has not passed and yields after every
+  500 of the rest, so one round covers every lapsed slot without stalling the
+  worker. With 200,000 expiring series across 10 workers at 20k rps this keeps
+  p99 at 2.16ms, against 746ms when every worker scans in one go (#23).
 - Reclaim expired shared-dict entries in batches, so no single
   `flush_expired()` call holds the dict lock for a whole backlog, refuse
   overlapping reclamation rounds, require `remove_expired_keys_interval` to be
