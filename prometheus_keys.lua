@@ -13,11 +13,14 @@ KeyIndex.__index = KeyIndex
 -- is shared through the dict, so later calls resume where this one stopped
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
+local MAX_PENDING_KEYS = 1000
+local RETRY_BATCH = 10
+local MAX_CHECKED_KEYS = 4096
+local CHECK_INTERVAL = 1
 
 
--- How many slots remove_expired_keys() checks between two yields. Each check
--- is one dict read, so a run of them stays well under a millisecond, and a
--- reader with a large index still gives the event loop back regularly.
+-- Yield between bounded batches of slot checks so a reader with a large
+-- index gives the event loop back regularly.
 local SWEEP_YIELD_EVERY = 500
 KeyIndex.SWEEP_YIELD_EVERY = SWEEP_YIELD_EVERY
 
@@ -30,25 +33,39 @@ local function remove_expired_keys(premature, self)
 end
 
 
--- A slot (prefix .. "key_" .. N) names one metric. It is written once, by the
--- worker that creates the metric's value in the dict (see register()), and it
--- never expires on its own: nothing has to renew it while the metric is in use.
+-- A slot names one metric and never expires on its own. A shared owner hint
+-- lets a writer find its slot without loading the reader's complete index.
 --
--- Only the processes that read the index -- the ones calling list(), which is
--- usually a single one serving /metrics -- keep a local copy of it, and they
--- are the ones that give a slot back once the value it names is gone. The
--- other workers only ever write slots, so they keep no local state and do no
--- dict reads on the request path.
-function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
+-- Readers and designated collectors keep a local copy of the index and give
+-- slots back once their values are gone. The
+-- other workers keep no index copy. They validate a shared owner hint when
+-- updating values, and retain only a bounded queue of failed registrations.
+-- Worker 0 collects even before the first scrape unless configured otherwise.
+function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval, collector)
   local self = setmetatable({}, KeyIndex)
   self.dict = shared_dict
   self.key_prefix = prefix .. "key_"
   self.key_count = prefix .. "key_count"
+  self.owner_prefix = prefix .. "owner_"
+  self.pending = {}
+  self.pending_count = 0
+  self.checked = {}
+  self.checked_keys = {}
+  self.next_checked = 1
+  if collector == nil then
+    collector = ngx.worker.id() == 0
+  end
+  self.collector = collector
   self.last = 0
   self.keys = {}
   self.index = {}
 
   ngx.timer.every(remove_expired_keys_interval or 600, remove_expired_keys, self)
+  ngx.timer.every(1, function(premature)
+    if not premature then
+      self:retry_pending()
+    end
+  end)
   return self
 end
 
@@ -81,14 +98,24 @@ local function sweep(self)
     if key then
       if self.index[key] ~= i then
         -- an older slot of a metric that has been registered again
-        self.dict:delete(self.key_prefix .. i)
+        if self.dict:get(self.key_prefix .. i) == key then
+          self.dict:delete(self.key_prefix .. i)
+        end
+        if self.dict:get(self.owner_prefix .. key) == i then
+          self.dict:delete(self.owner_prefix .. key)
+        end
         self.keys[i] = nil
       else
         local value, err = self.dict:get(key)
         if value == nil and not err then
           -- The value is gone (expired or deleted). Should it be created
           -- again, the worker creating it registers it in a new slot.
-          self.dict:delete(self.key_prefix .. i)
+          if self.dict:get(self.key_prefix .. i) == key then
+            self.dict:delete(self.key_prefix .. i)
+          end
+          if self.dict:get(self.owner_prefix .. key) == i then
+            self.dict:delete(self.owner_prefix .. key)
+          end
           self.keys[i] = nil
           self.index[key] = nil
         end
@@ -99,7 +126,7 @@ end
 
 
 function KeyIndex:remove_expired_keys()
-  if not self.reading then
+  if not self.reading and not self.collector then
     return
   end
 
@@ -129,7 +156,9 @@ end
 -- Loads the slots written since the last sync.
 function KeyIndex:sync()
   local N = self.dict:get(self.key_count) or 0
-  if N ~= self.last then
+  if N < self.last then
+    self:sync_range(0, N)
+  elseif N ~= self.last then
     self:sync_range(self.last, N)
   end
   return N
@@ -138,8 +167,12 @@ end
 -- Reads the slots from first to last.
 function KeyIndex:sync_range(first, last)
   for i = first, last do
-    local key = self.dict:get(self.key_prefix .. i)
-    if key then
+    local slot = self.key_prefix .. i
+    local key, _, stale = self.dict:get_stale(slot)
+    if key and (not stale or self.dict:get(key) ~= nil) then
+      -- Adopt legacy TTL slots before their nodes are reclaimed. Writers also
+      -- register existing values, so a lost legacy slot can be repaired.
+      self.dict:expire(slot, 0)
       self.keys[i] = key
       -- A metric created again after its value expired is registered in a new
       -- slot. Every reader keeps the newest one, and remove_expired_keys()
@@ -173,13 +206,12 @@ function KeyIndex:list()
   return copy
 end
 
--- Puts a key in a new slot. Called by the worker that has just created the
--- key's value in the dict, which is what makes it the only one doing so: the
--- value is created by add(), which only one worker can win.
+-- Allocate a slot and publish its owner hint. Concurrent repairs can create
+-- duplicate slots; readers retain the newest and reclaim the older ones.
 --
 -- Returns:
 -- nil on success, string with error message otherwise
-function KeyIndex:register(key, err_msg_lru_eviction)
+function KeyIndex:register(key, err_msg_lru_eviction, exptime)
   local retried = false
   local repairs = 0
   local repair_forcible = false
@@ -187,7 +219,14 @@ function KeyIndex:register(key, err_msg_lru_eviction)
     local N = (self.dict:get(self.key_count) or 0) + 1
     local ok, err, forcible = self.dict:add(self.key_prefix .. N, key)
     if ok then
-      local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
+      local _, count_err, forcible2 = self.dict:incr(self.key_count, 1, 0)
+      if count_err then
+        return "Unexpected error advancing key_count: " .. count_err
+      end
+      local stored, store_err = self.dict:safe_set(self.owner_prefix .. key, N, exptime)
+      if not stored then
+        return "Unexpected error recording key ownership: " .. store_err
+      end
       if forcible or forcible2 or repair_forcible then
         return (err_msg_lru_eviction .. "; key index: add key: idx=" ..
                 self.key_prefix .. N .. ", key=" .. key)
@@ -224,6 +263,98 @@ function KeyIndex:register(key, err_msg_lru_eviction)
       end
     end
     retried = true
+  end
+end
+
+-- Validate only this value's registration, never the full index. The owner
+-- entry is a hint: its slot must still name the same metric after eviction.
+function KeyIndex:ensure(key, err_msg_lru_eviction, exptime, created)
+  created = created or (self.pending[key] and self.pending[key].created)
+  local now = ngx.now()
+  if not created and not self.pending[key]
+      and self.checked[key] and self.checked[key] > now then
+    return nil
+  end
+  local i = self.dict:get(self.owner_prefix .. key)
+  local err
+  if not created and i and self.dict:get(self.key_prefix .. i) == key then
+    local count = self.dict:get(self.key_count)
+    if not count or count < i then
+      local current, forcible
+      current, err, forcible = self.dict:incr(self.key_count, 0, i)
+      if forcible then
+        err = err_msg_lru_eviction
+      end
+      if not err and current and current < i then
+        local advanced
+        advanced, err, forcible = self.dict:incr(self.key_count, i - current)
+        if forcible then
+          err = err_msg_lru_eviction
+        elseif not advanced and not err then
+          err = "failed to restore key_count"
+        end
+      end
+    end
+    if not err and exptime then
+      local ok
+      ok, err = self.dict:expire(self.owner_prefix .. key, exptime)
+      if not ok and err == "not found" then
+        err = self:register(key, err_msg_lru_eviction, exptime)
+      end
+    end
+  else
+    err = self:register(key, err_msg_lru_eviction, exptime)
+  end
+
+  if err then
+    if self.checked[key] then
+      self.checked[key] = 0
+    end
+    if self.pending[key] or self.pending_count < MAX_PENDING_KEYS then
+      if not self.pending[key] then
+        self.pending_count = self.pending_count + 1
+      end
+      self.pending[key] = {
+        message = err_msg_lru_eviction, exptime = exptime, created = created,
+      }
+    else
+      return err .. "; key index: registration retry queue is full"
+    end
+  else
+    if self.pending[key] then
+      self.pending[key] = nil
+      self.pending_count = self.pending_count - 1
+    end
+    if self.checked[key] == nil then
+      local old = self.checked_keys[self.next_checked]
+      if old then
+        self.checked[old] = nil
+      end
+      self.checked_keys[self.next_checked] = key
+      self.next_checked = self.next_checked % MAX_CHECKED_KEYS + 1
+    end
+    local interval = CHECK_INTERVAL
+    if exptime and exptime > 0 then
+      interval = math.min(interval, exptime / 2)
+    end
+    self.checked[key] = now + interval
+  end
+  return err
+end
+
+function KeyIndex:retry_pending()
+  local n = 0
+  for key, entry in pairs(self.pending) do
+    if n >= RETRY_BATCH then
+      break
+    end
+    n = n + 1
+    if self.dict:get(key) == nil then
+      self.pending[key] = nil
+      self.pending_count = self.pending_count - 1
+    else
+      self:ensure(key, entry.message, entry.exptime, entry.created)
+    end
   end
 end
 

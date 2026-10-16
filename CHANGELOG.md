@@ -6,12 +6,14 @@ of changes.
 
 ## Unreleased
 
-- Register a metric in the key index once, when its value is created, instead
-  of renewing its slot on every observation. Only the processes that list the
-  metrics keep a copy of the index, and they give a slot back once its value is
-  gone; the other workers keep no index and no reclaim timer work. With 200,000
-  expiring series across 10 workers, a writer worker's Lua heap drops from
-  ~24MB to ~1.5MB and the every-worker reclaim stalls are gone.
+- Keep complete metric indexes only in readers and designated collectors.
+  Worker 0 collects by default, independently of external scrapes; a dedicated
+  process can be selected with the `collector` option.
+- Repair missing registrations through shared owner hints and a bounded local
+  validation cache, without broadcasting or synchronizing writers' indexes.
+  Retry failed registrations in bounded batches without changing metric values.
+- Adopt legacy TTL slots during reads and register existing values on update,
+  preserving discoverability across upgrades and metadata eviction.
 
 ## 1.0.0
 

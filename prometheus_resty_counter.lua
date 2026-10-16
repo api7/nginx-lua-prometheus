@@ -56,12 +56,13 @@ local function sync(_, self)
       ngx.log(ngx.ERR, "error increasing counter in shdict key: ", k, ", err: ", err)
       ok = false
     end
-    if created then
-      if self.on_create then
-        self.on_create(k)
+    if not err then
+      if self.on_update then
+        self.on_update(k, value.t, created)
       end
-    elseif value.t then
-      self.dict:expire(k, value.t)
+      if value.t then
+        self.dict:expire(k, value.t)
+      end
     end
   end
 
@@ -73,9 +74,9 @@ local function sync(_, self)
   return ok
 end
 
--- on_create, if given, is called with the key of every value this worker
--- creates in the dict when it syncs.
-function _M.new(shdict_name, sync_interval, error_metric_name, on_create)
+-- on_update, if given, ensures registration after each successful shared
+-- update, including values whose index metadata may have been evicted.
+function _M.new(shdict_name, sync_interval, error_metric_name, on_update)
   id = ngx.worker.id()
 
   if not ngx_shared[shdict_name] then
@@ -90,7 +91,7 @@ function _M.new(shdict_name, sync_interval, error_metric_name, on_create)
     dict = ngx_shared[shdict_name],
     increments = increments[shdict_name],
     error_metric_name = error_metric_name,
-    on_create = on_create,
+    on_update = on_update,
   }, mt)
 
   if sync_interval then

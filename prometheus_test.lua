@@ -19,6 +19,14 @@ function SimpleDict:set(k, v, exptime)
   end
   return true, nil, forcible
 end
+function SimpleDict:safe_set(k, v, exptime)
+  return self:set(k, v, exptime)
+end
+function SimpleDict:get_stale(k)
+  local e = self.dict and self.dict[k]
+  if not e then return nil end
+  return e.value, nil, e.expired ~= nil and e.expired < os.time()
+end
 function SimpleDict:add(k, v, exptime)
   local forcible = false
   if k == "willnotfitk" or v == "willnotfitv" then
@@ -78,7 +86,7 @@ function SimpleDict:expire(k, exptime)
   if not self.dict[k] then
     return nil, "not found"
   end
-  self.dict[k]["expired"] = os.time() + exptime
+  self.dict[k]["expired"] = exptime > 0 and os.time() + exptime or nil
   return true  -- match ngx.shared.DICT:expire, which returns true on success
 end
 function SimpleDict:flush_expired(n)
@@ -143,6 +151,7 @@ function Nginx.worker.exiting()
   return false
 end
 function Nginx.sleep() end
+function Nginx.now() return os.time() end
 Nginx.timer = {}
 function Nginx.timer.every(_, _, _) end
 function Nginx.get_phase()
@@ -1103,6 +1112,162 @@ function TestKeyIndex:testSync()
   table.sort(keys)
   luaunit.assertEquals(ngx.logs, nil)
   luaunit.assertEquals(keys, {"key1", "key2", "key3"})
+end
+
+function TestKeyIndex:testEnsureRepairsLostSlot()
+  self.dict:set("live", 42)
+  self.key_index:ensure("live", "eviction_err", 60)
+  self.dict:delete("_prefix_key_1")
+  local now = ngx.now
+  ngx.now = function() return now() + 2 end
+  self.key_index:ensure("live", "eviction_err", 60)
+  ngx.now = now
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(fresh:list(), {"live"})
+  luaunit.assertEquals(self.dict:get("live"), 42)
+end
+
+function TestKeyIndex:testRecreationSurvivesConcurrentSweep()
+  self.dict:set("live", 1)
+  self.key_index:ensure("live", "eviction_err", 60, true)
+  self.key_index:list()
+  self.dict:delete("live")
+  local writer = require('prometheus_keys').new(self.dict, "_prefix_", 1, false)
+  local get = SimpleDict.get
+  self.dict.get = function(d, k)
+    if k == "live" then
+      self.dict.get = nil
+      d:set("live", 42)
+      writer:ensure("live", "eviction_err", 60, true)
+      return nil
+    end
+    return get(d, k)
+  end
+  self.key_index:remove_expired_keys()
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(fresh:list(), {"live"})
+  luaunit.assertEquals(self.dict:get("live"), 42)
+end
+
+function TestKeyIndex:testValidationCacheIsBounded()
+  for i = 1, 5000 do
+    local key = "live" .. i
+    self.dict:set(key, i)
+    self.key_index:ensure(key, "eviction_err")
+  end
+  local n = 0
+  for _ in pairs(self.key_index.checked) do n = n + 1 end
+  luaunit.assertEquals(n, 4096)
+  luaunit.assertEquals(#self.key_index.checked_keys, 4096)
+end
+
+function TestKeyIndex:testEnsureRejectsAnotherKeysSlot()
+  self.dict:set("live", 42)
+  self.dict:set("other", 99)
+  self.key_index:ensure("live", "eviction_err", 60)
+  self.key_index:ensure("other", "eviction_err", 60)
+  self.dict:set("_prefix_owner_live", 2)
+  local now = ngx.now
+  ngx.now = function() return now() + 2 end
+  self.key_index:ensure("live", "eviction_err", 60)
+  ngx.now = now
+  local keys = self.key_index:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"live", "other"})
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(self.dict:get("_prefix_owner_other"), 2)
+  luaunit.assertEquals(self.dict:get("other"), 99)
+end
+
+function TestKeyIndex:testPendingRegistrationRetriesWithoutAnotherObservation()
+  self.dict:set("live", 42)
+  local safe_set = SimpleDict.safe_set
+  self.dict.safe_set = function() return nil, "no memory" end
+  local err = self.key_index:ensure("live", "eviction_err", 60)
+  luaunit.assertStrContains(err, "no memory")
+  luaunit.assertEquals(self.key_index.pending_count, 1)
+  self.dict.safe_set = nil
+  self.key_index:retry_pending()
+  luaunit.assertEquals(self.key_index.pending_count, 0)
+  luaunit.assertEquals(self.dict:get("live"), 42)
+  luaunit.assertEquals(self.dict:get("_prefix_owner_live"), 2)
+  luaunit.assertEquals(SimpleDict.safe_set, safe_set)
+end
+
+function TestKeyIndex:testPendingRetriesAreBounded()
+  local register = self.key_index.register
+  self.key_index.register = function() return "no memory" end
+  for i = 1, 1001 do
+    local key = "retry" .. i
+    self.dict:set(key, 1)
+    local err = self.key_index:ensure(key, "eviction_err")
+    if i == 1001 then
+      luaunit.assertStrContains(err, "retry queue is full")
+    end
+  end
+  luaunit.assertEquals(self.key_index.pending_count, 1000)
+  self.key_index.register = register
+  self.key_index:retry_pending()
+  luaunit.assertEquals(self.key_index.pending_count, 990)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 10)
+end
+
+function TestKeyIndex:testPendingExpiredValueIsDiscarded()
+  self.dict:set("live", 42)
+  self.dict.safe_set = function() return nil, "no memory" end
+  self.key_index:ensure("live", "eviction_err")
+  self.dict.safe_set = nil
+  self.dict:delete("live")
+  self.key_index:retry_pending()
+  luaunit.assertEquals(self.key_index.pending_count, 0)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
+end
+
+function TestKeyIndex:testCollectorReclaimsWithoutList()
+  local collector = require('prometheus_keys').new(self.dict, "_prefix_", 1, true)
+  collector:register("gone", "eviction_err")
+  collector:remove_expired_keys()
+  luaunit.assertNil(self.dict:get("_prefix_key_1"))
+  luaunit.assertNil(self.dict:get("_prefix_owner_gone"))
+  luaunit.assertFalse(collector.reading or false)
+end
+
+function TestKeyIndex:testWorkerZeroCollectsByDefault()
+  local id = ngx.worker.id
+  ngx.worker.id = function() return 0 end
+  local collector = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  ngx.worker.id = id
+  collector:register("gone", "eviction_err")
+  collector:remove_expired_keys()
+  luaunit.assertNil(self.dict:get("_prefix_key_1"))
+end
+
+function TestKeyIndex:testSyncAdoptsExpiredLegacySlot()
+  self.dict:set("live", 42)
+  self.dict:set("_prefix_key_1", "live")
+  self.dict.dict["_prefix_key_1"].expired = os.time() - 1
+  self.dict:set("_prefix_key_count", 1)
+  luaunit.assertEquals(self.key_index:list(), {"live"})
+  luaunit.assertEquals(self.dict:ttl("_prefix_key_1"), 0)
+end
+
+function TestKeyIndex:testEnsureRestoresEvictedCounter()
+  register_live(self.key_index, self.dict, 3)
+  self.key_index:list()
+  self.dict:set("_prefix_key_count", 1)
+  self.key_index:ensure("key3", "eviction_err")
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(#fresh:list(), 3)
+end
+
+function TestKeyIndex:testSyncReadsSlotsAfterCounterReset()
+  register_live(self.key_index, self.dict, 3)
+  self.key_index:list()
+  self.dict:set("_prefix_key_1", "new")
+  self.dict:set("_prefix_key_count", 1)
+  self.key_index:sync()
+  luaunit.assertEquals(self.key_index.index.new, 1)
 end
 
 function TestPrometheus:testLookupMaxSize()
