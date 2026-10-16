@@ -206,6 +206,25 @@ function KeyIndex:list()
   return copy
 end
 
+-- Metadata repair must not evict the values it is trying to expose.
+local function ensure_counter(self, minimum)
+  local n = self.dict:get(self.key_count)
+  if not n then
+    local ok, err = self.dict:safe_add(self.key_count, minimum)
+    if not ok and err ~= "exists" then
+      return nil, err
+    end
+    n = self.dict:get(self.key_count)
+    if not n then
+      return nil, "not found"
+    end
+  end
+  if n < minimum then
+    return self.dict:incr(self.key_count, minimum - n)
+  end
+  return n
+end
+
 -- Allocate a slot and publish its owner hint. Concurrent repairs can create
 -- duplicate slots; readers retain the newest and reclaim the older ones.
 --
@@ -216,12 +235,16 @@ function KeyIndex:register(key, err_msg_lru_eviction, exptime)
   local repairs = 0
   local repair_forcible = false
   while true do
-    local N = (self.dict:get(self.key_count) or 0) + 1
-    local ok, err, forcible = self.dict:add(self.key_prefix .. N, key)
+    local count, count_err = ensure_counter(self, 0)
+    if not count then
+      return "Unexpected error restoring key_count: " .. count_err
+    end
+    local N = count + 1
+    local ok, err, forcible = self.dict:safe_add(self.key_prefix .. N, key)
     if ok then
-      local _, count_err, forcible2 = self.dict:incr(self.key_count, 1, 0)
-      if count_err then
-        return "Unexpected error advancing key_count: " .. count_err
+      local _, publish_err, forcible2 = self.dict:incr(self.key_count, 1)
+      if publish_err then
+        return "Unexpected error advancing key_count: " .. publish_err
       end
       local stored, store_err = self.dict:safe_set(self.owner_prefix .. key, N, exptime)
       if not stored then
@@ -246,7 +269,7 @@ function KeyIndex:register(key, err_msg_lru_eviction, exptime)
     -- with the shared-dict lock held hot (apache/apisix#12275). Advance the
     -- counter past the occupied slot instead.
     if retried then
-      local _, incr_err, forcible3 = self.dict:incr(self.key_count, 1, 0)
+      local _, incr_err, forcible3 = self.dict:incr(self.key_count, 1)
       if incr_err then
         return "Unexpected error advancing key_count: " .. incr_err
       end
@@ -278,22 +301,12 @@ function KeyIndex:ensure(key, err_msg_lru_eviction, exptime, created)
   local i = self.dict:get(self.owner_prefix .. key)
   local err
   if not created and i and self.dict:get(self.key_prefix .. i) == key then
-    local count = self.dict:get(self.key_count)
-    if not count or count < i then
-      local current, forcible
-      current, err, forcible = self.dict:incr(self.key_count, 0, i)
-      if forcible then
-        err = err_msg_lru_eviction
-      end
-      if not err and current and current < i then
-        local advanced
-        advanced, err, forcible = self.dict:incr(self.key_count, i - current)
-        if forcible then
-          err = err_msg_lru_eviction
-        elseif not advanced and not err then
-          err = "failed to restore key_count"
-        end
-      end
+    local count, forcible
+    count, err, forcible = ensure_counter(self, i)
+    if forcible then
+      err = err_msg_lru_eviction
+    elseif not count and not err then
+      err = "failed to restore key_count"
     end
     if not err and exptime then
       local ok

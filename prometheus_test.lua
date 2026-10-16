@@ -19,6 +19,12 @@ function SimpleDict:set(k, v, exptime)
   end
   return true, nil, forcible
 end
+function SimpleDict:safe_add(k, v, exptime)
+  if k == "willnotfitk" or v == "willnotfitv" then
+    return nil, "no memory"
+  end
+  return self:add(k, v, exptime)
+end
 function SimpleDict:safe_set(k, v, exptime)
   return self:set(k, v, exptime)
 end
@@ -829,9 +835,8 @@ function TestKeyIndex:testRegister()
 
   -- error should be returned when memory is full
   local err = self.key_index:register("willnotfitv", "eviction_err")
-  luaunit.assertEquals(err,
-    "eviction_err; key index: add key: idx=_prefix_key_3, key=willnotfitv")
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
+  luaunit.assertEquals(err, "Unexpected error adding a key: no memory")
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 2)
 end
 
 -- A worker that only writes the index never reads it back, so it holds no
@@ -1192,6 +1197,20 @@ function TestKeyIndex:testPendingRegistrationRetriesWithoutAnotherObservation()
   luaunit.assertEquals(self.dict:get("live"), 42)
   luaunit.assertEquals(self.dict:get("_prefix_owner_live"), 2)
   luaunit.assertEquals(SimpleDict.safe_set, safe_set)
+end
+
+function TestKeyIndex:testFailedRecreationDoesNotReuseOldSlot()
+  self.dict:set("live", 1)
+  self.key_index:ensure("live", "eviction_err", 60, true)
+  self.dict:set("live", 42)
+  self.dict.safe_set = function() return nil, "no memory" end
+  self.key_index:ensure("live", "eviction_err", 60, true)
+  self.dict.safe_set = nil
+  self.key_index:ensure("live", "eviction_err", 60)
+  luaunit.assertEquals(self.dict:get("_prefix_owner_live"), 3)
+  luaunit.assertEquals(self.key_index.pending_count, 0)
+  luaunit.assertEquals(self.dict:get("live"), 42)
+  luaunit.assertEquals(self.key_index:list(), {"live"})
 end
 
 function TestKeyIndex:testPendingRetriesAreBounded()

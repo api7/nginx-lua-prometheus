@@ -142,6 +142,14 @@ keeps at most 1000 pending keys and retries up to 10 keys per second. A full
 retry queue is reported as an error; after dictionary capacity is exhausted,
 new observations may be required for keys that could not be queued. Expired
 values are discarded from the queue. Retrying never resets a metric value.
+Metadata allocation uses `safe_add` and
+`safe_set`, so a background repair cannot force-evict metric values. Ordinary
+value writes can still force eviction when the dictionary is full.
+
+Old releases ignore owner hints when rolling back. Hints with a TTL eventually
+expire; permanent hints retain their shared-memory allocation until a cold
+restart or explicit cleanup. Allow for this metadata footprint when sizing the
+dictionary or rolling back.
 
 On reload, existing values are registered on their next update, and readers
 adopt legacy TTL slots (including expired nodes whose values are still live).
