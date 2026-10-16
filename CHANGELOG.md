@@ -4,6 +4,17 @@ This file only calls out major changes. Please see [the list of Git commits](
 https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
 
+## Unreleased
+
+- Keep complete metric indexes only in readers and designated collectors.
+  Worker 0 collects by default, independently of external scrapes; a dedicated
+  process can be selected with the `collector` option.
+- Repair missing registrations through shared owner hints and a bounded local
+  validation cache, without broadcasting or synchronizing writers' indexes.
+  Retry failed registrations in bounded batches without changing metric values.
+- Adopt legacy TTL slots during reads and register existing values on update,
+  preserving discoverability across upgrades and metadata eviction.
+
 ## 1.0.0
 
 Starting with this release, this fork (`nginx-lua-prometheus-api7`) uses

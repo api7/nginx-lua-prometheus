@@ -106,6 +106,13 @@ section of nginx configuration.
   * `sync_interval` (number): sets per-worker counter sync interval in seconds.
     This sets the boundary on eventual consistency of counter metrics. Defaults
     to 1.
+  * `collector` (boolean): enables index cleanup even before the first scrape.
+    Defaults to `true` in worker 0 and `false` in other workers. For a dedicated
+    metrics process, set this to `true` there and `false` in request workers.
+    Processes that call `metric_data()` or `reset()` also clean their indexes.
+  * `remove_expired_keys_interval` (number): interval between index cleanup
+    rounds in seconds. Defaults to 3600; lower it when short-lived labels churn
+    rapidly, according to the shared dictionary's capacity.
   * `lookup_max_size` (number): maximum size of a per-metric lookup table
     maintained by each worker to cache full metric names. Defaults to 1000.
     If you have metrics with extremely high cardinality and lots of available
@@ -121,6 +128,33 @@ init_worker_by_lua_block {
   prometheus = require("prometheus").init("prometheus_metrics", {sync_interval=3})
 }
 ```
+
+Registrations use one additional shared dictionary entry per metric value,
+`__ngx_prom__owner_<metric key>`, pointing to the current index slot. Writers
+validate this hint against the slot without synchronizing the full index.
+Each process caches at most 4096 successful validations for up to one second
+(or half the metric TTL, whichever is shorter). An actively updated value
+therefore repairs evicted index metadata on its next validation. Cache misses
+and genuinely new values are checked immediately.
+
+Failed registrations are retried independently of observations: each process
+keeps at most 1000 pending keys and retries up to 10 keys per second. A full
+retry queue is reported as an error; after dictionary capacity is exhausted,
+new observations may be required for keys that could not be queued. Expired
+values are discarded from the queue. Retrying never resets a metric value.
+Metadata allocation uses `safe_add` and
+`safe_set`, so a background repair cannot force-evict metric values. Ordinary
+value writes can still force eviction when the dictionary is full.
+
+Old releases ignore owner hints when rolling back. Hints with a TTL eventually
+expire; permanent hints retain their shared-memory allocation until a cold
+restart or explicit cleanup. Allow for this metadata footprint when sizing the
+dictionary or rolling back.
+
+On reload, existing values are registered on their next update, and readers
+adopt legacy TTL slots (including expired nodes whose values are still live).
+The dictionary's expired nodes must still exist for this reader-only adoption;
+metadata already physically reclaimed is recovered by subsequent observations.
 
 ### prometheus:counter()
 

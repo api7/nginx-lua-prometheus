@@ -415,12 +415,6 @@ local function lookup_or_create(self, label_values)
   local LEAF_KEY = mt -- key used to store full metric names in leaf tables.
   local full_name = t[LEAF_KEY]
   if full_name then
-    if self.exptime and self.exptime > 0 then
-      local err = self._key_index:add(full_name, ERR_MSG_LRU_EVICTION, self.exptime)
-      if err then
-        return nil, err
-      end
-    end
     return full_name
   end
 
@@ -456,11 +450,15 @@ local function lookup_or_create(self, label_values)
 
   self.lookup_size = self.lookup_size + 1
 
-  local err = self._key_index:add(full_name, ERR_MSG_LRU_EVICTION, self.exptime)
-  if err then
-    return nil, err
-  end
   return full_name
+end
+
+-- Ensure that an existing value remains discoverable after metadata loss.
+local function ensure_key(self, key, created)
+  local err = self._key_index:ensure(key, ERR_MSG_LRU_EVICTION, self.exptime, created)
+  if err then
+    self._log_error(err)
+  end
 end
 
 -- Increment a gauge metric.
@@ -480,12 +478,25 @@ local function inc_gauge(self, value, label_values)
     return
   end
 
-  _, err, forcible = self._dict:incr(k, value, 0)
+  local created = false
+  _, err, forcible = self._dict:incr(k, value)
+  if err == "not found" then
+    local added
+    added, err, forcible = self._dict:add(k, value, self.exptime)
+    if added then
+      created = true
+    elseif err == "exists" then
+      _, err, forcible = self._dict:incr(k, value)
+    end
+  end
   if err or forcible then
     self._log_error_kv(k, value, err or ERR_MSG_LRU_EVICTION)
   end
-  if self.exptime then
-    self._dict:expire(k, self.exptime)
+  if not err then
+    ensure_key(self, k, created)
+    if self.exptime then
+      self._dict:expire(k, self.exptime)
+    end
   end
 end
 
@@ -550,11 +561,9 @@ local function del(self, label_values)
     ngx.sleep(self.parent.sync_interval)
   end
 
-  err = self._key_index:remove(k, ERR_MSG_LRU_EVICTION)
-  if err then
-    self._log_error(err)
-  end
-
+  -- The slot naming it is given back by the processes reading the index, once
+  -- they see the value is gone.
+  self._dict:delete(self._key_index.owner_prefix .. k)
   _, err = self._dict:delete(k)
   if err then
     self._log_error("Error deleting key: ".. k .. ": " .. err)
@@ -579,9 +588,22 @@ local function set(self, value, label_values)
     self._log_error(err)
     return
   end
-  _, err, forcible = self._dict:set(k, value, self.exptime)
+  local ok
+  local created = false
+  ok, err, forcible = self._dict:replace(k, value, self.exptime)
+  if not ok and err == "not found" then
+    ok, err, forcible = self._dict:add(k, value, self.exptime)
+    if ok then
+      created = true
+    elseif err == "exists" then
+      _, err, forcible = self._dict:replace(k, value, self.exptime)
+    end
+  end
   if err or forcible then
     self._log_error_kv(k, value, err or ERR_MSG_LRU_EVICTION)
+  end
+  if not err then
+    ensure_key(self, k, created)
   end
 end
 
@@ -684,13 +706,8 @@ local function reset(self)
         end
       end
       if remove then
-        local _, err
-        err = self._key_index:remove(key, ERR_MSG_LRU_EVICTION)
-        if err then
-          self._log_error(err)
-        end
-
-        _, err = self._dict:set(key, nil)
+        self._dict:delete(self._key_index.owner_prefix .. key)
+        local _, err = self._dict:set(key, nil)
         if err then
           self._log_error("Error resetting '", key, "': ", err)
         end
@@ -755,13 +772,20 @@ function Prometheus.init(dict_name, options_or_prefix)
   end
 
   self.registry = {}
-  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX, self.remove_expired_keys_interval)
+  local collector
+  if type(options_or_prefix) == "table" then
+    collector = options_or_prefix.collector
+  end
+  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
+    self.remove_expired_keys_interval, collector)
 
   self.initialized = true
 
   self:counter(self.error_metric_name, "Number of nginx-lua-prometheus errors")
-  self.dict:set(self.error_metric_name, 0)
-  local err = self.key_index:add(self.error_metric_name, ERR_MSG_LRU_EVICTION)
+  if not self.dict:add(self.error_metric_name, 0) then
+    self.dict:set(self.error_metric_name, 0)
+  end
+  local err = self.key_index:ensure(self.error_metric_name, ERR_MSG_LRU_EVICTION)
   if err then
     self:log_error(err)
   end
@@ -794,7 +818,13 @@ function Prometheus:init_worker(sync_interval)
   end
   self.sync_interval = sync_interval or DEFAULT_SYNC_INTERVAL
   local counter_instance, err = resty_counter_lib.new(
-      self.dict_name, self.sync_interval, self.error_metric_name)
+      self.dict_name, self.sync_interval, self.error_metric_name,
+      function(key, exptime, created)
+        local reg_err = self.key_index:ensure(key, ERR_MSG_LRU_EVICTION, exptime, created)
+        if reg_err then
+          self:log_error(reg_err)
+        end
+      end)
   if err then
     error(err, 2)
   end

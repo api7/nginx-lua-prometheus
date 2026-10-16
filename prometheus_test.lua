@@ -19,6 +19,20 @@ function SimpleDict:set(k, v, exptime)
   end
   return true, nil, forcible
 end
+function SimpleDict:safe_add(k, v, exptime)
+  if k == "willnotfitk" or v == "willnotfitv" then
+    return nil, "no memory"
+  end
+  return self:add(k, v, exptime)
+end
+function SimpleDict:safe_set(k, v, exptime)
+  return self:set(k, v, exptime)
+end
+function SimpleDict:get_stale(k)
+  local e = self.dict and self.dict[k]
+  if not e then return nil end
+  return e.value, nil, e.expired ~= nil and e.expired < os.time()
+end
 function SimpleDict:add(k, v, exptime)
   local forcible = false
   if k == "willnotfitk" or v == "willnotfitv" then
@@ -37,9 +51,25 @@ function SimpleDict:incr(k, v, init)
      (self.forcible_keys and self.forcible_keys[k]) then
     forcible = true
   end
-  if not self.dict[k] then self.dict[k] = {value = init} end
+  local e = self.dict[k]
+  if e and e["expired"] and e["expired"] < os.time() then
+    e = nil  -- an expired entry reads as missing, like ngx.shared.DICT
+  end
+  if not e then
+    if init == nil then
+      return nil, "not found", false
+    end
+    self.dict[k] = {value = init}
+  end
   self.dict[k]["value"] = self.dict[k]["value"] + (v or 1)
   return self.dict[k]["value"], nil, forcible  -- newval, err, forcible
+end
+function SimpleDict:replace(k, v, exptime)
+  local e = self.dict and self.dict[k]
+  if not e or (e["expired"] and e["expired"] < os.time()) then
+    return false, "not found", false
+  end
+  return self:set(k, v, exptime)
 end
 function SimpleDict:get(k)
   -- simulate key not exist
@@ -62,7 +92,7 @@ function SimpleDict:expire(k, exptime)
   if not self.dict[k] then
     return nil, "not found"
   end
-  self.dict[k]["expired"] = os.time() + exptime
+  self.dict[k]["expired"] = exptime > 0 and os.time() + exptime or nil
   return true  -- match ngx.shared.DICT:expire, which returns true on success
 end
 function SimpleDict:flush_expired(n)
@@ -123,7 +153,11 @@ Nginx.worker = {}
 function Nginx.worker.id()
   return 'testworker'
 end
+function Nginx.worker.exiting()
+  return false
+end
 function Nginx.sleep() end
+function Nginx.now() return os.time() end
 Nginx.timer = {}
 function Nginx.timer.every(_, _, _) end
 function Nginx.get_phase()
@@ -777,171 +811,73 @@ end
 function TestKeyIndex.testInit()
   luaunit.assertEquals(ngx.logs, nil)
 end
-function TestKeyIndex:testAdd()
-  self.key_index:add("single", "eviction_err")
+local function slot_count(dict, prefix)
+  local n = 0
+  for k in pairs(dict.dict or {}) do
+    if k:find(prefix .. "key_", 1, true) == 1 and k ~= prefix .. "key_count" then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+function TestKeyIndex:testRegister()
+  luaunit.assertEquals(self.key_index:register("single", "eviction_err"), nil)
   luaunit.assertEquals(ngx.logs, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
   luaunit.assertEquals(self.dict:get("_prefix_key_1"), "single")
+  -- slots carry no expiry of their own
+  luaunit.assertEquals(self.dict:ttl("_prefix_key_1"), 0)
 
-  self.key_index:add({"multiple", "keys"}, "eviction_err")
-  luaunit.assertEquals(ngx.logs, nil)
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
-  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "multiple")
-  luaunit.assertEquals(self.dict:get("_prefix_key_3"), "keys")
-
-  -- adding already existing key should do nothing
-  self.key_index:add("single", "eviction_err")
-  luaunit.assertEquals(ngx.logs, nil)
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
+  self.key_index:register("other", "eviction_err")
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 2)
+  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "other")
 
   -- error should be returned when memory is full
-  local err = self.key_index:add("willnotfitv", "eviction_err")
-  luaunit.assertEquals(err,
-    "eviction_err; key index: add key: idx=_prefix_key_4, key=willnotfitv")
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 4)
-end
-function TestKeyIndex:testRemove()
-  self.key_index:add({"key1", "key2", "key3"}, "eviction_err")
-
-  self.key_index:remove("key2")
-  luaunit.assertEquals(ngx.logs, nil)
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
-  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), 1)
-  local keys = self.key_index:list()
-  luaunit.assertEquals(#keys, 2)
-  luaunit.assertEquals(keys[1], "key1")
-  luaunit.assertEquals(keys[2], "key3")
-
-  self.key_index:remove("key4")
-  luaunit.assertEquals(#ngx.logs, 1)
-  keys = self.key_index:list()
-  luaunit.assertEquals(#keys, 2)
-  luaunit.assertEquals(keys[1], "key1")
-  luaunit.assertEquals(keys[2], "key3")
-end
-function TestKeyIndex:testList()
-  self.key_index:add({"key1", "key2", "key3"}, "eviction_err")
-  local keys = self.key_index:list()
-  luaunit.assertEquals(ngx.logs, nil)
-  luaunit.assertEquals(#keys, 3)
-  luaunit.assertEquals(keys[1], "key1")
-  luaunit.assertEquals(keys[2], "key2")
-  luaunit.assertEquals(keys[3], "key3")
+  local err = self.key_index:register("willnotfitv", "eviction_err")
+  luaunit.assertEquals(err, "Unexpected error adding a key: no memory")
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 2)
 end
 
--- Regression test for apache/apisix#11934 (duplicate metrics).
--- A key with an exptime is added and synced (self.last now tracks N). The key
--- then expires in the underlying shared dict without going through remove(), so
--- neither key_count nor delete_count changes and the next sync() is a no-op,
--- leaving self.index still pointing at the now-vanished slot. Re-adding the key
--- therefore takes the "expired" path in add() and allocates a new slot while
--- the stale slot lingers in self.keys. Before the fix, delete_count was not
--- bumped (other workers never re-synced) and list() iterated self.keys, so the
--- same key was emitted twice -> duplicate metrics.
-function TestKeyIndex:testExpiredReAddNoDuplicate()
-  local err = self.key_index:add("expkey", "eviction_err", 1)
-  luaunit.assertEquals(err, nil)
-  self.key_index:sync()
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
-  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "expkey")
-  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), nil)
-  luaunit.assertEquals(self.key_index.index["expkey"], 1)
+-- A worker that only writes the index never reads it back, so it holds no
+-- local copy of it.
+function TestKeyIndex:testWriterKeepsNoLocalState()
+  for i = 1, 10 do
+    self.key_index:register("key" .. i, "eviction_err")
+  end
+  luaunit.assertEquals(self.key_index.last, 0)
+  luaunit.assertEquals(next(self.key_index.keys), nil)
+  luaunit.assertEquals(next(self.key_index.index), nil)
 
-  -- A second worker sharing the same shared dict syncs the initial state, so it
-  -- now holds slot 1 in its local self.keys/index. This is the worker that the
-  -- delete_count bump must later force to re-sync and reclaim the stale slot.
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
-  worker2:sync()
-  luaunit.assertEquals(worker2.index["expkey"], 1)
-  luaunit.assertEquals(#worker2:list(), 1)
-
-  -- Let the key expire in the underlying shared dict. key_count and
-  -- delete_count are untouched, so the next sync() inside add() is a no-op and
-  -- the local index keeps pointing at the (now gone) slot 1.
-  sleep(2)
-  luaunit.assertEquals(self.dict:get("_prefix_key_1"), nil)
-
-  -- Re-adding the now-expired key takes the expired branch and allocates slot 2.
-  err = self.key_index:add("expkey", "eviction_err", 1)
-  luaunit.assertEquals(err, nil)
-  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "expkey")
-
-  -- delete_count must have been bumped on the expired re-add path so that
-  -- other workers do a full sync and drop the stale slot.
-  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), 1)
-
-  -- list() must report the key exactly once, not twice.
-  local keys = self.key_index:list()
-  luaunit.assertEquals(#keys, 1)
-  luaunit.assertEquals(keys[1], "expkey")
-
-  -- The second worker must converge: its next sync() sees the bumped
-  -- delete_count, does a full sync, drops the stale slot 1 and picks up slot 2.
-  -- Without the delete_count bump it would keep slot 1 forever and list() the
-  -- key twice.
-  worker2:sync()
-  luaunit.assertEquals(worker2.keys[1], nil)
-  luaunit.assertEquals(worker2.index["expkey"], 2)
-  local keys2 = worker2:list()
-  luaunit.assertEquals(#keys2, 1)
-  luaunit.assertEquals(keys2[1], "expkey")
-end
-
--- remove_expired_keys() must physically reclaim the shared-dict space of
--- expired entries, not just drop the worker-local references to them.
--- Logically expired entries keep occupying slab pages, and the passive
--- per-write expiry scan cannot reach them once a permanent entry sits at the
--- LRU tail, so without an explicit flush the dict grows without bound under
--- label churn (apache/apisix#13658).
-function TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict()
-  local err = self.key_index:add("expkey", "eviction_err", 1)
-  luaunit.assertEquals(err, nil)
-  -- A metric value key: lives in the same dict, and KeyIndex never reads it.
-  self.dict:set("expkey", 1, 1)
-  -- A permanent entry, like the error metric or any metric without an exptime.
-  self.dict:set("permanent", 1)
-
-  sleep(2)
-
-  -- Both entries are logically gone but still physically present: every dict
-  -- API reports them as missing while they still hold their slab pages.
-  luaunit.assertEquals(self.dict:ttl("_prefix_key_1"), nil)
-  luaunit.assertNotNil(self.dict.dict["_prefix_key_1"])
-  luaunit.assertNotNil(self.dict.dict["expkey"])
-
+  -- nor does its timer touch the dict: removing slots is the readers' job
+  self.dict:set("_prefix_key_count", 10)
   self.key_index:remove_expired_keys()
-
-  -- Both the index slot and the metric value must be reclaimed in the same
-  -- round. Before the fix remove_expired_keys() issued no dict writes at all,
-  -- so both entries survived and the dict only ever grew.
-  luaunit.assertNil(self.dict.dict["_prefix_key_1"])
-  luaunit.assertNil(self.dict.dict["expkey"])
-  -- Entries that have not expired must be left alone.
-  luaunit.assertNotNil(self.dict.dict["permanent"])
+  luaunit.assertEquals(slot_count(self.dict, "_prefix_"), 10)
 end
 
--- The index slots of a churning metric must not accumulate: each round expires
--- the previous slot, and the reclaim must keep the dict bounded rather than
--- letting every new series step free space down for good.
-function TestKeyIndex:testExpiredSlotsDoNotAccumulate()
-  for _ = 1, 3 do
-    luaunit.assertEquals(self.key_index:add("churn", "eviction_err", 1), nil)
-    sleep(2)
-    self.key_index:remove_expired_keys()
-  end
-
-  local live = 0
-  for k in pairs(self.dict.dict) do
-    if k:find("_prefix_key_", 1, true) == 1 then live = live + 1 end
-  end
-  -- Slot numbers keep advancing (key_count is monotonic), but at most the most
-  -- recent slot may still be physically present; the earlier ones are gone.
-  luaunit.assertTrue(live <= 1)
+function TestKeyIndex:testList()
+  local writer = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  writer:register("key1", "eviction_err")
+  writer:register("key2", "eviction_err")
+  writer:register("key3", "eviction_err")
+  local keys = self.key_index:list()
+  table.sort(keys)
+  luaunit.assertEquals(ngx.logs, nil)
+  luaunit.assertEquals(keys, {"key1", "key2", "key3"})
 end
 
--- list() must de-duplicate when self.keys transiently holds the same key in two
--- slots (the window before a stale slot is reclaimed): only the slot the index
--- points at is canonical. This isolates the list() guard from the add() path.
+-- A metric created again after its value expired is registered in a new slot
+-- while the old one may still be there: it must be listed once.
+function TestKeyIndex:testListKeepsTheNewestSlot()
+  self.key_index:register("dup", "eviction_err")
+  self.key_index:register("dup", "eviction_err")
+  local keys = self.key_index:list()
+  luaunit.assertEquals(keys, {"dup"})
+  luaunit.assertEquals(self.key_index.index["dup"], 2)
+end
+
+-- list() must de-duplicate when self.keys holds the same key in two slots:
+-- only the slot the index points at is canonical.
 function TestKeyIndex:testListDeduplicatesStaleSlot()
   self.key_index.keys = {[1] = "dup", [2] = "dup"}
   self.key_index.index = {dup = 2}
@@ -953,101 +889,215 @@ function TestKeyIndex:testListDeduplicatesStaleSlot()
   luaunit.assertEquals(keys[1], "dup")
 end
 
+-- A reader gives back the slot of a value that is gone, and keeps the others.
+function TestKeyIndex:testRemoveExpiredKeysGivesBackSlotsOfGoneValues()
+  self.dict:set("live", 1)
+  self.key_index:register("live", "eviction_err")
+  self.key_index:register("gone", "eviction_err")
+  luaunit.assertEquals(#self.key_index:list(), 2)
+
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.dict:get("_prefix_key_1"), "live")
+  luaunit.assertNil(self.dict.dict["_prefix_key_2"])
+  luaunit.assertEquals(self.key_index:list(), {"live"})
+  luaunit.assertNil(self.key_index.index["gone"])
+end
+
+-- ... and the older slots of a metric registered again.
+function TestKeyIndex:testRemoveExpiredKeysGivesBackOlderSlots()
+  self.dict:set("dup", 1)
+  self.key_index:register("dup", "eviction_err")
+  self.key_index:register("dup", "eviction_err")
+  self.key_index:list()
+
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertNil(self.dict.dict["_prefix_key_1"])
+  luaunit.assertEquals(self.dict:get("_prefix_key_2"), "dup")
+  luaunit.assertEquals(self.key_index:list(), {"dup"})
+end
+
+-- A slot given back by one reader is gone for the others too, and they
+-- converge without being told.
+function TestKeyIndex:testReadersConverge()
+  self.dict:set("live", 1)
+  self.key_index:register("live", "eviction_err")
+  self.key_index:register("gone", "eviction_err")
+  local reader2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(#self.key_index:list(), 2)
+  luaunit.assertEquals(#reader2:list(), 2)
+
+  self.key_index:remove_expired_keys()
+  reader2:remove_expired_keys()
+  luaunit.assertEquals(reader2:list(), {"live"})
+
+  -- a reader started afterwards only ever sees what is left
+  local reader3 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(reader3:list(), {"live"})
+end
+
+-- remove_expired_keys() must physically reclaim the shared-dict space of
+-- expired entries, not just drop the references to them. Logically expired
+-- entries keep occupying slab pages, and the passive per-write expiry scan
+-- cannot reach them once a permanent entry sits at the LRU tail
+-- (apache/apisix#13658).
+function TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict()
+  self.dict:set("expkey", 1, 1)
+  self.key_index:register("expkey", "eviction_err")
+  self.dict:set("permanent", 1)
+  self.key_index:list()
+
+  sleep(2)
+  luaunit.assertNotNil(self.dict.dict["expkey"])
+
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertNil(self.dict.dict["_prefix_key_1"])
+  luaunit.assertNil(self.dict.dict["expkey"])
+  luaunit.assertNotNil(self.dict.dict["permanent"])
+end
+
+-- The slots of a churning metric must not accumulate.
+function TestKeyIndex:testExpiredSlotsDoNotAccumulate()
+  for _ = 1, 3 do
+    self.dict:set("churn", 1, 1)
+    luaunit.assertEquals(self.key_index:register("churn", "eviction_err"), nil)
+    self.key_index:list()
+    sleep(2)
+    self.key_index:remove_expired_keys()
+  end
+  luaunit.assertEquals(slot_count(self.dict, "_prefix_"), 0)
+end
+
+local function register_live(key_index, dict, n)
+  for i = 1, n do
+    dict:set("key" .. i, 1)
+    key_index:register("key" .. i, "eviction_err")
+  end
+end
+
+-- A large index is checked in steps, with a yield in between, so that a
+-- reader does not hold up its event loop for the whole of it.
+function TestKeyIndex:testRemoveExpiredKeysYields()
+  local every = require('prometheus_keys').SWEEP_YIELD_EVERY
+  register_live(self.key_index, self.dict, every * 2 + 1)
+  self.key_index:list()
+
+  local yields = 0
+  ngx.sleep = function() yields = yields + 1 end
+  self.key_index:remove_expired_keys()
+  ngx.sleep = nil
+  luaunit.assertEquals(yields, 2)
+  luaunit.assertEquals(#self.key_index:list(), every * 2 + 1)
+end
+
+-- A run yields, so the timer can fire again before it has finished: the
+-- second run must step aside rather than check the same slots again.
+function TestKeyIndex:testRemoveExpiredKeysDoesNotOverlap()
+  local every = require('prometheus_keys').SWEEP_YIELD_EVERY
+  register_live(self.key_index, self.dict, every + 1)
+  self.key_index:list()
+
+  local gets = 0
+  local get = SimpleDict.get
+  self.dict.get = function(d, k)
+    gets = gets + 1
+    return get(d, k)
+  end
+  local nested
+  ngx.sleep = function()
+    ngx.sleep = nil
+    local before = gets
+    self.key_index:remove_expired_keys()
+    nested = gets - before
+  end
+  self.key_index:remove_expired_keys()
+  self.dict.get = nil
+  luaunit.assertEquals(nested, 0)
+end
+
+-- A worker that is shutting down stops at its next yield.
+function TestKeyIndex:testRemoveExpiredKeysStopsWhenExiting()
+  local every = require('prometheus_keys').SWEEP_YIELD_EVERY
+  self.key_index:register("gone", "eviction_err")
+  self.key_index:list()
+  register_live(self.key_index, self.dict, every)
+  for i = 1, every do
+    self.key_index:register("gone" .. i, "eviction_err")
+  end
+  self.key_index:list()
+
+  local exiting = ngx.worker.exiting
+  ngx.worker.exiting = function() return true end
+  self.key_index:remove_expired_keys()
+  ngx.worker.exiting = exiting
+
+  -- the first step ran, the rest was left for the next worker
+  luaunit.assertNil(self.dict.dict["_prefix_key_1"])
+  luaunit.assertEquals(self.dict:get("_prefix_key_" .. (every + 2)), "gone1")
+  -- and the guard is released
+  luaunit.assertFalse(self.key_index.sweeping)
+end
+
 -- Regression test for apache/apisix#12275 (workers pinned at 100% CPU).
--- key_count is an ordinary shared-dict node: it is only refreshed when a new
--- key is registered, so under steady traffic it goes cold and, once the dict
--- is full, gets LRU-evicted while higher-numbered slots survive. sync() then
--- reads it as 0 and add() keeps calling dict:add() on the same occupied slot:
--- "exists" -> retry -> "exists", forever, without yielding. Before the fix
--- this call never returned and the worker spun at 100% CPU; the fix advances
--- key_count past occupied slots so add() terminates and repairs the counter.
-function TestKeyIndex:testAddAfterKeyCountEvicted()
+-- key_count is an ordinary shared-dict node and can be LRU-evicted while
+-- higher-numbered slots survive. register() must advance it past the occupied
+-- slots rather than retry the same one forever.
+function TestKeyIndex:testRegisterAfterKeyCountEvicted()
   for i = 1, 50 do
-    self.key_index:add("key" .. i, "eviction_err")
+    self.key_index:register("key" .. i, "eviction_err")
   end
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 50)
 
   -- the shared dict force-evicts its LRU-tail node, which is key_count
   self.dict:delete("_prefix_key_count")
 
-  local err = self.key_index:add("newkey", "eviction_err")
+  local err = self.key_index:register("newkey", "eviction_err")
   luaunit.assertEquals(err, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_51"), "newkey")
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 51)
-  luaunit.assertEquals(self.key_index.index["newkey"], 51)
 end
 
--- Same eviction, seen from a freshly started worker (e.g. respawned after a
--- crash, or after nginx reload) whose local index is empty: it must adopt the
--- surviving slots while repairing the counter instead of spinning.
-function TestKeyIndex:testAddAfterKeyCountEvictedFreshWorker()
-  for i = 1, 50 do
-    self.key_index:add("key" .. i, "eviction_err")
-  end
-  self.dict:delete("_prefix_key_count")
-
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
-  local err = worker2:add("newkey", "eviction_err")
-  luaunit.assertEquals(err, nil)
-  luaunit.assertEquals(self.dict:get("_prefix_key_51"), "newkey")
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 51)
-  -- surviving slots were adopted into the local index along the way
-  luaunit.assertEquals(worker2.index["key7"], 7)
-  luaunit.assertEquals(worker2.index["newkey"], 51)
-end
-
--- One add() call bounds its repair work (MAX_KEY_COUNT_REPAIRS = 1000) and
--- degrades by dropping the sample, like the existing dict-full path. The
--- advanced counter is shared, so a later call resumes and converges.
+-- One register() call bounds its repair work (MAX_KEY_COUNT_REPAIRS = 1000)
+-- and degrades by dropping the key. The advanced counter is shared, so a later
+-- call resumes and converges.
 function TestKeyIndex:testKeyCountRepairIsBounded()
-  local keys = {}
   for i = 1, 1500 do
-    keys[i] = "key" .. i
+    self.key_index:register("key" .. i, "eviction_err")
   end
-  self.key_index:add(keys, "eviction_err")
   self.dict:delete("_prefix_key_count")
 
-  local err = self.key_index:add("newkey", "eviction_err")
+  local err = self.key_index:register("newkey", "eviction_err")
   luaunit.assertStrContains(err, "key_count fell behind occupied slots")
   -- bounded progress was made and persisted for the next call
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1000)
 
-  err = self.key_index:add("newkey", "eviction_err")
+  err = self.key_index:register("newkey", "eviction_err")
   luaunit.assertEquals(err, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_1501"), "newkey")
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1501)
 end
 
--- If the repair increments forcibly displaced other entries and the requested
--- key then turns out to already exist (it gets adopted from an occupied slot
--- during the repair crawl), the eviction must still be reported through the
--- LRU-eviction error, exactly like the new-slot success path reports
--- forcible/forcible2.
+-- If the repair increments forcibly displaced other entries, the eviction must
+-- still be reported through the LRU-eviction error.
 function TestKeyIndex:testKeyCountRepairReportsForcibleEviction()
   for i = 1, 50 do
-    self.key_index:add("key" .. i, "eviction_err")
+    self.key_index:register("key" .. i, "eviction_err")
   end
   self.dict:delete("_prefix_key_count")
-  -- re-creating/incrementing key_count now displaces other entries
   self.dict.forcible_keys = {["_prefix_key_count"] = true}
 
-  -- a worker with an empty local index registers a key that already exists in
-  -- the dict at a slot ahead of the (rewound) counter: the repair crawl adopts
-  -- it and exits through the existing-key break.
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
-  local err = worker2:add("key30", "eviction_err")
+  local err = self.key_index:register("newkey", "eviction_err")
   luaunit.assertStrContains(err,
-    "eviction_err; key index: adopted key after key_count repair: " ..
-    "idx=_prefix_key_30, key=key30")
-  luaunit.assertEquals(worker2.index["key30"], 30)
-  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 30)
+    "eviction_err; key index: add key: idx=_prefix_key_51, key=newkey")
+  luaunit.assertEquals(self.dict:get("_prefix_key_51"), "newkey")
 end
 
 function TestKeyIndex:testSync()
   self.key_index:sync()
   luaunit.assertEquals(ngx.logs, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_count"), nil)
-  luaunit.assertEquals(self.dict:get("_prefix_delete_count"), nil)
 
   -- key added by another worker
   self.dict:set("_prefix_key_count", 1)
@@ -1064,22 +1114,179 @@ function TestKeyIndex:testSync()
   self.dict:set("_prefix_key_3", "key3")
   self.key_index:sync()
   keys = self.key_index:list()
+  table.sort(keys)
   luaunit.assertEquals(ngx.logs, nil)
-  luaunit.assertEquals(#keys, 3)
-  luaunit.assertEquals(keys[1], "key1")
-  luaunit.assertEquals(keys[2], "key2")
-  luaunit.assertEquals(keys[3], "key3")
+  luaunit.assertEquals(keys, {"key1", "key2", "key3"})
+end
 
-  -- key deleted by another worker
-  self.dict:set("_prefix_delete_count", 1)
-  self.dict:delete("_prefix_key_2")
-  self.dict:set("_prefix_key_3", "key3")
+function TestKeyIndex:testEnsureRepairsLostSlot()
+  self.dict:set("live", 42)
+  self.key_index:ensure("live", "eviction_err", 60)
+  self.dict:delete("_prefix_key_1")
+  local now = ngx.now
+  ngx.now = function() return now() + 2 end
+  self.key_index:ensure("live", "eviction_err", 60)
+  ngx.now = now
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(fresh:list(), {"live"})
+  luaunit.assertEquals(self.dict:get("live"), 42)
+end
+
+function TestKeyIndex:testRecreationSurvivesConcurrentSweep()
+  self.dict:set("live", 1)
+  self.key_index:ensure("live", "eviction_err", 60, true)
+  self.key_index:list()
+  self.dict:delete("live")
+  local writer = require('prometheus_keys').new(self.dict, "_prefix_", 1, false)
+  local get = SimpleDict.get
+  self.dict.get = function(d, k)
+    if k == "live" then
+      self.dict.get = nil
+      d:set("live", 42)
+      writer:ensure("live", "eviction_err", 60, true)
+      return nil
+    end
+    return get(d, k)
+  end
+  self.key_index:remove_expired_keys()
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(fresh:list(), {"live"})
+  luaunit.assertEquals(self.dict:get("live"), 42)
+end
+
+function TestKeyIndex:testValidationCacheIsBounded()
+  for i = 1, 5000 do
+    local key = "live" .. i
+    self.dict:set(key, i)
+    self.key_index:ensure(key, "eviction_err")
+  end
+  local n = 0
+  for _ in pairs(self.key_index.checked) do n = n + 1 end
+  luaunit.assertEquals(n, 4096)
+  luaunit.assertEquals(#self.key_index.checked_keys, 4096)
+end
+
+function TestKeyIndex:testEnsureRejectsAnotherKeysSlot()
+  self.dict:set("live", 42)
+  self.dict:set("other", 99)
+  self.key_index:ensure("live", "eviction_err", 60)
+  self.key_index:ensure("other", "eviction_err", 60)
+  self.dict:set("_prefix_owner_live", 2)
+  local now = ngx.now
+  ngx.now = function() return now() + 2 end
+  self.key_index:ensure("live", "eviction_err", 60)
+  ngx.now = now
+  local keys = self.key_index:list()
+  table.sort(keys)
+  luaunit.assertEquals(keys, {"live", "other"})
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(self.dict:get("_prefix_owner_other"), 2)
+  luaunit.assertEquals(self.dict:get("other"), 99)
+end
+
+function TestKeyIndex:testPendingRegistrationRetriesWithoutAnotherObservation()
+  self.dict:set("live", 42)
+  local safe_set = SimpleDict.safe_set
+  self.dict.safe_set = function() return nil, "no memory" end
+  local err = self.key_index:ensure("live", "eviction_err", 60)
+  luaunit.assertStrContains(err, "no memory")
+  luaunit.assertEquals(self.key_index.pending_count, 1)
+  self.dict.safe_set = nil
+  self.key_index:retry_pending()
+  luaunit.assertEquals(self.key_index.pending_count, 0)
+  luaunit.assertEquals(self.dict:get("live"), 42)
+  luaunit.assertEquals(self.dict:get("_prefix_owner_live"), 2)
+  luaunit.assertEquals(SimpleDict.safe_set, safe_set)
+end
+
+function TestKeyIndex:testFailedRecreationDoesNotReuseOldSlot()
+  self.dict:set("live", 1)
+  self.key_index:ensure("live", "eviction_err", 60, true)
+  self.dict:set("live", 42)
+  self.dict.safe_set = function() return nil, "no memory" end
+  self.key_index:ensure("live", "eviction_err", 60, true)
+  self.dict.safe_set = nil
+  self.key_index:ensure("live", "eviction_err", 60)
+  luaunit.assertEquals(self.dict:get("_prefix_owner_live"), 3)
+  luaunit.assertEquals(self.key_index.pending_count, 0)
+  luaunit.assertEquals(self.dict:get("live"), 42)
+  luaunit.assertEquals(self.key_index:list(), {"live"})
+end
+
+function TestKeyIndex:testPendingRetriesAreBounded()
+  local register = self.key_index.register
+  self.key_index.register = function() return "no memory" end
+  for i = 1, 1001 do
+    local key = "retry" .. i
+    self.dict:set(key, 1)
+    local err = self.key_index:ensure(key, "eviction_err")
+    if i == 1001 then
+      luaunit.assertStrContains(err, "retry queue is full")
+    end
+  end
+  luaunit.assertEquals(self.key_index.pending_count, 1000)
+  self.key_index.register = register
+  self.key_index:retry_pending()
+  luaunit.assertEquals(self.key_index.pending_count, 990)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 10)
+end
+
+function TestKeyIndex:testPendingExpiredValueIsDiscarded()
+  self.dict:set("live", 42)
+  self.dict.safe_set = function() return nil, "no memory" end
+  self.key_index:ensure("live", "eviction_err")
+  self.dict.safe_set = nil
+  self.dict:delete("live")
+  self.key_index:retry_pending()
+  luaunit.assertEquals(self.key_index.pending_count, 0)
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 1)
+end
+
+function TestKeyIndex:testCollectorReclaimsWithoutList()
+  local collector = require('prometheus_keys').new(self.dict, "_prefix_", 1, true)
+  collector:register("gone", "eviction_err")
+  collector:remove_expired_keys()
+  luaunit.assertNil(self.dict:get("_prefix_key_1"))
+  luaunit.assertNil(self.dict:get("_prefix_owner_gone"))
+  luaunit.assertFalse(collector.reading or false)
+end
+
+function TestKeyIndex:testWorkerZeroCollectsByDefault()
+  local id = ngx.worker.id
+  ngx.worker.id = function() return 0 end
+  local collector = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  ngx.worker.id = id
+  collector:register("gone", "eviction_err")
+  collector:remove_expired_keys()
+  luaunit.assertNil(self.dict:get("_prefix_key_1"))
+end
+
+function TestKeyIndex:testSyncAdoptsExpiredLegacySlot()
+  self.dict:set("live", 42)
+  self.dict:set("_prefix_key_1", "live")
+  self.dict.dict["_prefix_key_1"].expired = os.time() - 1
+  self.dict:set("_prefix_key_count", 1)
+  luaunit.assertEquals(self.key_index:list(), {"live"})
+  luaunit.assertEquals(self.dict:ttl("_prefix_key_1"), 0)
+end
+
+function TestKeyIndex:testEnsureRestoresEvictedCounter()
+  register_live(self.key_index, self.dict, 3)
+  self.key_index:list()
+  self.dict:set("_prefix_key_count", 1)
+  self.key_index:ensure("key3", "eviction_err")
+  luaunit.assertEquals(self.dict:get("_prefix_key_count"), 3)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(#fresh:list(), 3)
+end
+
+function TestKeyIndex:testSyncReadsSlotsAfterCounterReset()
+  register_live(self.key_index, self.dict, 3)
+  self.key_index:list()
+  self.dict:set("_prefix_key_1", "new")
+  self.dict:set("_prefix_key_count", 1)
   self.key_index:sync()
-  keys = self.key_index:list()
-  luaunit.assertEquals(ngx.logs, nil)
-  luaunit.assertEquals(#keys, 2)
-  luaunit.assertEquals(keys[1], "key1")
-  luaunit.assertEquals(keys[2], "key3")
+  luaunit.assertEquals(self.key_index.index.new, 1)
 end
 
 function TestPrometheus:testLookupMaxSize()
@@ -1130,49 +1337,40 @@ function TestPrometheus.testPrintfTable()
   luaunit.assertEquals(p._table_to_string({nil,2,nil,"foo",nil}), "<nil,2>")
 end
 
+-- Metrics with an exptime: the worker creating a value registers it, and the
+-- process reading the index gives its slot back once the value has expired.
 function TestPrometheus:testKeyTimeout()
+  local ki = self.p.key_index
+  local function slot_of(key)
+    ki:list()
+    local i = ki.index[key]
+    luaunit.assertNotNil(i)
+    luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), key)
+    return i
+  end
+
   self.counter_exp:inc(1)
+  -- counters are registered when their value reaches the dict
+  ki:list()
+  luaunit.assertNil(ki.index["metric_exp"])
   self.p._counter:sync()
   luaunit.assertEquals(self.dict:get("metric_exp"), 1)
-  local i = self.p.key_index.index["metric_exp"]
-  luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), "metric_exp")
-  luaunit.assertEquals(self.p.key_index.keys[i], "metric_exp")
-
-  sleep(1)
-  self.p.key_index:sync()
-  luaunit.assertEquals(self.dict:get("metric_exp"), nil)
-  luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), nil)
-  luaunit.assertEquals(self.p.key_index.index["metric_exp"], nil)
-  luaunit.assertEquals(self.p.key_index.keys[i], nil)
+  local i = slot_of("metric_exp")
 
   self.gauge_exp:inc(1)
   luaunit.assertEquals(self.dict:get("gauge_exp"), 1)
-  i = self.p.key_index.index["gauge_exp"]
-  luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), "gauge_exp")
-  luaunit.assertEquals(self.p.key_index.keys[i], "gauge_exp")
-
-  sleep(1)
-  self.p.key_index:sync()
-  luaunit.assertEquals(self.dict:get("gauge_exp"), nil)
-  luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), nil)
-  luaunit.assertEquals(self.p.key_index.index["gauge_exp"], nil)
-  luaunit.assertEquals(self.p.key_index.keys[i], nil)
+  local j = slot_of("gauge_exp")
 
   self.gauge_exp_2:set(1)
-  self.p.key_index:sync()
-  self.p.key_index:remove_expired_keys()
   luaunit.assertEquals(self.dict:get("gauge_exp_2"), 1)
-  i = self.p.key_index.index["gauge_exp_2"]
-  luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), "gauge_exp_2")
-  luaunit.assertEquals(self.p.key_index.keys[i], "gauge_exp_2")
+  local k = slot_of("gauge_exp_2")
 
-  sleep(1)
-  self.p.key_index:sync()
-  self.p.key_index:remove_expired_keys()
-  luaunit.assertEquals(self.dict:get("gauge_exp_2"), nil)
-  luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), nil)
-  luaunit.assertEquals(self.p.key_index.index["gauge_exp_2"], nil)
-  luaunit.assertEquals(self.p.key_index.keys[i], nil)
+  -- a value already there is not registered again
+  self.counter_exp:inc(1)
+  self.p._counter:sync()
+  self.gauge_exp:inc(1)
+  self.gauge_exp_2:set(2)
+  local count = self.dict:get("__ngx_prom__key_count")
 
   self.hist_exp:observe(0.35)
   self.hist_exp:observe(0.4)
@@ -1183,36 +1381,72 @@ function TestPrometheus:testKeyTimeout()
   luaunit.assertEquals(self.dict:get('l_exp_bucket{le="Inf"}'), 2)
   luaunit.assertEquals(self.dict:get('l_exp_count'), 2)
   luaunit.assertEquals(self.dict:get('l_exp_sum'), 0.75)
+  -- only the buckets that were hit have a value, and a slot
+  luaunit.assertNil(ki.index['l_exp_bucket{le="00.300"}'])
+  slot_of('l_exp_bucket{le="00.400"}')
+  local hit = 3  -- _count, _sum and le="Inf"
+  for _, b in ipairs(self.hist_exp.buckets) do
+    if b >= 0.35 then hit = hit + 1 end
+  end
+  luaunit.assertEquals(self.dict:get("__ngx_prom__key_count") - count, hit)
 
   sleep(1)
-  luaunit.assertEquals(self.dict:get('l_exp_bucket{le="00.300"}'), nil)
-  luaunit.assertEquals(self.dict:get('l_exp_bucket{le="00.400"}'), nil)
-  luaunit.assertEquals(self.dict:get('l_exp_bucket{le="00.500"}'), nil)
-  luaunit.assertEquals(self.dict:get('l_exp_bucket{le="Inf"}'), nil)
-  luaunit.assertEquals(self.dict:get('l_exp_count'), nil)
-  luaunit.assertEquals(self.dict:get('l_exp_sum'), nil)
-
+  ki:remove_expired_keys()
+  for _, key in ipairs({"metric_exp", "gauge_exp", "gauge_exp_2",
+                        'l_exp_count', 'l_exp_bucket{le="Inf"}'}) do
+    luaunit.assertEquals(self.dict:get(key), nil)
+    luaunit.assertNil(ki.index[key])
+  end
+  for _, n in ipairs({i, j, k}) do
+    luaunit.assertNil(self.dict.dict["__ngx_prom__key_" .. n])
+    luaunit.assertNil(ki.keys[n])
+  end
+  -- the error metric has no exptime and stays
+  luaunit.assertNotNil(ki.index["nginx_metric_errors_total"])
 end
 
+-- A metric whose value expired is registered again when it comes back.
 function TestPrometheus:testKeyTimeout2()
+  local ki = self.p.key_index
   self.counter_exp_2:inc(1)
   self.p._counter:sync()
+  ki:list()
+  local first = ki.index["metric_exp2"]
   sleep(2)
-  self.p.key_index:sync()
-  self.p.key_index:remove_expired_keys()
+  ki:remove_expired_keys()
+  luaunit.assertNil(ki.index["metric_exp2"])
+
   self.counter_exp_2:inc(1)
   self.p._counter:sync()
-  local i = self.p.key_index.index["metric_exp2"]
-  luaunit.assertEquals(self.p.key_index.keys[i], "metric_exp2")
-
+  ki:list()
+  local i = ki.index["metric_exp2"]
+  luaunit.assertTrue(i > first)
+  luaunit.assertEquals(ki.keys[i], "metric_exp2")
+  luaunit.assertEquals(self.dict:get("metric_exp2"), 1)
 end
 
--- Same as TestKeyIndex:testRemoveExpiredKeysReclaimsSharedDict, but driven
--- through the public metric API: once a counter with an exptime goes stale,
+-- Expired before the reader has even looked: it is still registered again.
+function TestPrometheus:testKeyComesBackBeforeItIsSwept()
+  local ki = self.p.key_index
+  self.gauge_exp:set(1)
+  sleep(2)
+  self.gauge_exp:set(5)
+  local keys = {}
+  for _, key in ipairs(ki:list()) do
+    if key == "gauge_exp" then keys[#keys + 1] = key end
+  end
+  luaunit.assertEquals(keys, {"gauge_exp"})
+  ki:remove_expired_keys()
+  luaunit.assertEquals(slot_count(self.dict, "__ngx_prom__"), 2)
+  luaunit.assertEquals(self.dict:get("gauge_exp"), 5)
+end
+
+-- Through the public metric API: once a counter with an exptime goes stale,
 -- neither its value key nor its index slot may keep occupying the shared dict.
 function TestPrometheus:testExpiredMetricIsReclaimedFromDict()
   self.counter_exp:inc(1)
   self.p._counter:sync()
+  self.p.key_index:list()
   local i = self.p.key_index.index["metric_exp"]
   luaunit.assertNotNil(i)
   luaunit.assertEquals(self.dict:get("metric_exp"), 1)
