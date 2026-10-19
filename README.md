@@ -112,37 +112,12 @@ section of nginx configuration.
     RAM, you might want to increase this to avoid cache getting flushed too
     often. Decreasing this makes sense if you have a very large number of
     metrics or need to minimize memory usage of this library.
-  * `remove_expired_keys_interval` (number): how often, in seconds, each worker
-    drops the metrics that have expired and reclaims the shared dict entries
-    they left behind. Defaults to 1800. There is no upper bound; values below
-    the minimum of 20 are raised to it, with a warning, because one round of
-    reclamation can occupy its timer for up to 10 seconds and must not take
-    more than half of its own interval.
-
-    A round does bounded work at a time -- it reclaims at most a batch of
-    entries, only asks the dict about the slots whose recorded deadline has
-    passed, and yields after every 500 of them -- so it never holds up the
-    worker for long, however many metrics there are. Each round still covers
-    every slot that has lapsed, so the worker-local index keeps up with the
-    rate the metrics expire at.
-
-    The interval decides how much backlog one round has to reclaim -- the
-    expiry rate times the interval, times two, since a series leaves a value
-    key and an index slot behind. A backlog larger than the dict's spare
-    capacity makes the writes that create new series force-evict live ones, so
-    the interval has a ceiling of
-    `(dict entries - live entries) / (2 * expiry rate)`. On a 128m dict, which
-    holds about 520,000 entries of a typical shape, the default tolerates
-    roughly 117 expiring series per second with 100,000 live entries, 89 with
-    200,000, and 34 with 400,000. Lower it if your churn is higher than that,
-    and raise it freely if your metrics have no `exptime` at all, since then
-    nothing ever expires.
-
-    Pulling the other way, reclaiming is also what makes a metric give up its
-    slot number: one whose entry is still in the dict comes back on the same
-    number, one whose entry has been reclaimed has to take a new one. A short
-    interval therefore buys memory headroom with slot numbers, and the default
-    is the middle of that trade.
+  * `remove_expired_keys_interval` (number): cleanup interval in seconds.
+    Defaults to 1800. Values below 20 are raised to 20 with a warning; there
+    is no upper bound. Cleanup checks slots whose recorded deadlines have
+    passed and yields between groups of TTL checks. Choose an interval based
+    on dictionary capacity and label churn: longer intervals retain more
+    expired entries until reclamation.
   * `auto_flush_expired` (boolean): whether that reclamation also happens on
     the interval above, in every worker. Defaults to true. Set it to false to
     schedule [`prometheus:flush_expired()`](#prometheusflush_expired) yourself,
@@ -275,32 +250,19 @@ Returns metric data as an array of strings.
 
 **syntax:** prometheus:flush_expired()
 
-Reclaims the shared dict entries left behind by metrics that have expired, and
-returns how many were reclaimed.
+Reclaims expired shared-dictionary entries and returns the number reclaimed.
+By default, each worker calls this during cleanup. Set `auto_flush_expired`
+to false to schedule reclamation yourself, for example from a single process.
+Worker-local index cleanup still runs when automatic reclamation is disabled.
 
-Expired entries are only logically gone: every shared dict API reports them as
-missing, but they keep holding their memory until something reclaims them. The
-passive reclamation nginx performs on writes cannot do it, because it stops at
-the first entry that has not expired, and a metric registered without an
-`exptime` inevitably ends up sitting there.
+Each call frees at most 50,000 entries per batch and runs at most 10 batches,
+yielding for one second between full batches. Remaining expired entries are
+left for a later call. These limits do not bound runtime: the underlying
+shared-dictionary operation holds the dictionary lock and may scan all entries
+to find expired ones. Actual latency depends on dictionary contents and load.
 
-This is done for you on `remove_expired_keys_interval`, in every worker, unless
-`auto_flush_expired` is set to false. Call this instead if you would rather
-reclaim from a single process, or on your own schedule.
-
-The reclamation is issued in batches, because the underlying
-`ngx.shared.DICT:flush_expired()` holds the dict lock until it returns: a
-bounded number of entries is reclaimed per call, and the other workers get the
-lock back in between. Note that the batch bounds only the freeing, not the
-walk: that call scans the whole LRU queue and stops early only once the batch
-has been freed, so every call pays for the scan again. The batch is therefore
-sized so that a normal round -- the expiry rate times
-`remove_expired_keys_interval` -- is drained in a single call, and a backlog
-larger than one round is spread over several, at most 500000 entries and 10
-seconds per round. What is left over is picked up by the next round.
-
-Overlapping rounds are refused: a call that arrives while one is still running
-reclaims nothing and returns 0.
+Concurrent calls on the same instance return 0 while reclamation is running;
+this guard does not coordinate different workers.
 
 ### counter:inc()
 

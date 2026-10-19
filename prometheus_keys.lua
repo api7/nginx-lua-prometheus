@@ -39,11 +39,8 @@ end
 
 -- Stagger worker cleanup timers to avoid starting every scan together.
 local function start_remove_expired_keys_timer(self, interval)
-  local id = tonumber(ngx.worker.id()) or 0
-  local count = ngx.worker.count and tonumber(ngx.worker.count()) or 1
-  if id < 0 or not count or count < 1 then
-    id, count = 0, 1
-  end
+  local id = ngx.worker.id() or 0
+  local count = ngx.worker.count()
 
   local offset = interval * id / count
   if offset <= 0 then
@@ -71,7 +68,6 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   self.key_count = prefix .. "key_count"
   self.last = 0
   self.deleted = 0
-  self.not_expired_index = 1
   self.keys = {}
   self.index = {}
   self.expire_keys = {}

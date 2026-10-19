@@ -121,7 +121,10 @@ function Nginx.print(printed)
 end
 Nginx.worker = {}
 function Nginx.worker.id()
-  return 'testworker'
+  return 0
+end
+function Nginx.worker.count()
+  return 1
 end
 function Nginx.worker.exiting()
   return false
@@ -1001,6 +1004,43 @@ function TestKeyIndex:testFlushExpiredRunsInBatches()
 
   self.dict.flush_expired = nil
   luaunit.assertNotNil(self.dict.dict["permanent"])
+end
+
+function TestKeyIndex:testCleanupTimersAreStaggeredByWorker()
+  local id, count = ngx.worker.id, ngx.worker.count
+  local at, every = ngx.timer.at, ngx.timer.every
+  local scheduled
+  ngx.worker.count = function() return 4 end
+  ngx.timer.at = function(delay, callback, context)
+    scheduled = {kind="at", delay=delay, callback=callback, context=context}
+  end
+  ngx.timer.every = function(delay, callback, context)
+    scheduled = {kind="every", delay=delay, callback=callback, context=context}
+  end
+
+  local cases = {{id=0}, {id=2}, {}}
+  local results = {}
+  for i, case in ipairs(cases) do
+    ngx.worker.id = function() return case.id end
+    local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
+    local calls = 0
+    key_index.remove_expired_keys = function() calls = calls + 1 end
+    local first = scheduled
+    if first.kind == "at" then
+      first.callback(true, first.context)
+      local after_shutdown = calls
+      first.callback(false, first.context)
+      results[i] = {first.kind, first.delay, scheduled.kind, scheduled.delay,
+                    after_shutdown, calls}
+    else
+      results[i] = {first.kind, first.delay}
+    end
+  end
+  ngx.worker.id, ngx.worker.count = id, count
+  ngx.timer.at, ngx.timer.every = at, every
+
+  luaunit.assertEquals(results, {{"every", 60},
+    {"at", 30, "every", 60, 0, 1}, {"every", 60}})
 end
 
 function TestKeyIndex:testCleanupTimerSkipsPrematureCallbacks()
