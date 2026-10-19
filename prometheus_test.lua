@@ -1003,10 +1003,45 @@ function TestKeyIndex:testFlushExpiredRunsInBatches()
   luaunit.assertNotNil(self.dict.dict["permanent"])
 end
 
--- The local scan is what a round actually costs: a lock acquisition per slot
--- the worker knows has a ttl. It avoids most of them by remembering when it
--- recorded each slot expiring, and asking the dict only once that has passed --
--- so while the metrics are being renewed a round touches the dict not at all.
+function TestKeyIndex:testCleanupTimerSkipsPrematureCallbacks()
+  local every = ngx.timer.every
+  local callback, context
+  ngx.timer.every = function(_, fn, key_index)
+    callback, context = fn, key_index
+  end
+  local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
+  ngx.timer.every = every
+
+  local calls = 0
+  key_index.remove_expired_keys = function() calls = calls + 1 end
+  callback(true, context)
+  luaunit.assertEquals(calls, 0)
+  callback(false, context)
+  luaunit.assertEquals(calls, 1)
+end
+
+function TestKeyIndex:testRemoveExpiredKeysStopsCheckingPermanentSlots()
+  luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 600))
+  local i = self.key_index.index["permanent"]
+  self.dict:expire(self.key_index.key_prefix .. i, 0)
+  self.key_index.expire_keys[i] = 0
+
+  local checked = 0
+  self.dict.ttl = function(dict, key)
+    checked = checked + 1
+    return SimpleDict.ttl(dict, key)
+  end
+  self.key_index:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+  self.dict.ttl = nil
+
+  luaunit.assertEquals(checked, 1)
+  luaunit.assertNil(self.key_index.expire_keys[i])
+  luaunit.assertEquals(self.key_index.index["permanent"], i)
+  luaunit.assertEquals(self.dict:get(self.key_index.key_prefix .. i), "permanent")
+end
+
+-- Future deadlines require no shared-dictionary TTL checks.
 function TestKeyIndex:testRemoveExpiredKeysSkipsSlotsThatCannotHaveLapsed()
   local keys = {}
   for i = 1, 100 do
