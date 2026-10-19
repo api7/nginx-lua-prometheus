@@ -251,6 +251,8 @@ Returns metric data as an array of strings.
 **syntax:** prometheus:flush_expired()
 
 Reclaims expired shared-dictionary entries and returns the number reclaimed.
+If a batch or pause fails, returns the count reclaimed so far and the error;
+the error is also logged.
 By default, each worker calls this during cleanup. Set `auto_flush_expired`
 to false to schedule reclamation yourself, for example from a single process.
 Worker-local index cleanup still runs when automatic reclamation is disabled.

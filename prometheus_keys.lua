@@ -112,9 +112,8 @@ local function remove_expired_slots(self)
         end
         self.keys[i] = nil
         self.expire_keys[i] = nil
-      elseif ttl == 0 then
-        self.expire_keys[i] = nil
       elseif ttl then
+        -- Zero also occurs at the expiration boundary; keep tracking it.
         self.expire_keys[i] = now + ttl
       end
     end
@@ -152,45 +151,30 @@ function KeyIndex:remove_expired_keys()
 end
 
 
--- Local index cleanup does not release shared-dictionary allocations.
--- Reclaim expired nodes in batches, yielding between full batches.
-local function flush_expired_batches(self)
-  local total = 0
-  for batch = 1, FLUSH_EXPIRED_MAX_BATCHES do
-    local freed = self.dict:flush_expired(FLUSH_EXPIRED_BATCH)
-    total = total + freed
-    -- A short batch exhausted the expired entries; pause only before retrying.
-    if freed < FLUSH_EXPIRED_BATCH or batch == FLUSH_EXPIRED_MAX_BATCHES then
-      break
-    end
-
-    ngx.sleep(FLUSH_EXPIRED_BATCH_DELAY)
-  end
-
-  return total
-end
-
-
+-- Reclaim shared-dictionary allocations separately from the local index.
 function KeyIndex:flush_expired()
-  -- A round yields between batches, so the timer can fire again before the
-  -- previous run finished (ngx.timer.every does not wait for it), and a caller
-  -- scheduling its own round can overlap with it too. Two rounds racing for the
-  -- dict lock double the stall and reclaim nothing extra, so the second one
-  -- steps aside.
   if self.flushing then
     return 0
   end
 
   self.flushing = true
-  -- pcall so that a throwing ngx.sleep -- a caller reaching this from a phase
-  -- that does not allow yielding -- cannot leave the guard set and stop the
-  -- reclamation for the life of the worker.
-  local ok, total = pcall(flush_expired_batches, self)
+  local total = 0
+  -- Keep progress outside pcall and release the guard even if a batch or sleep fails.
+  local ok, err = pcall(function()
+    for batch = 1, FLUSH_EXPIRED_MAX_BATCHES do
+      local freed = self.dict:flush_expired(FLUSH_EXPIRED_BATCH)
+      total = total + freed
+      if freed < FLUSH_EXPIRED_BATCH or batch == FLUSH_EXPIRED_MAX_BATCHES then
+        break
+      end
+      ngx.sleep(FLUSH_EXPIRED_BATCH_DELAY)
+    end
+  end)
   self.flushing = false
 
   if not ok then
-    ngx.log(ngx.ERR, "failed to reclaim expired entries: ", tostring(total))
-    return 0
+    ngx.log(ngx.ERR, "failed to reclaim expired entries: ", tostring(err))
+    return total, err
   end
 
   return total

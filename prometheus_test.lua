@@ -1060,25 +1060,39 @@ function TestKeyIndex:testCleanupTimerSkipsPrematureCallbacks()
   luaunit.assertEquals(calls, 1)
 end
 
-function TestKeyIndex:testRemoveExpiredKeysStopsCheckingPermanentSlots()
+function TestKeyIndex:testRemoveExpiredKeysKeepsPermanentSlots()
   luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 600))
   local i = self.key_index.index["permanent"]
-  self.dict:expire(self.key_index.key_prefix .. i, 0)
+  local slot = self.key_index.key_prefix .. i
+  self.dict:set(slot, "permanent")
   self.key_index.expire_keys[i] = 0
 
-  local checked = 0
-  self.dict.ttl = function(dict, key)
-    checked = checked + 1
-    return SimpleDict.ttl(dict, key)
-  end
   self.key_index:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.key_index.index["permanent"], i)
+  luaunit.assertEquals(self.dict:get(slot), "permanent")
+end
+
+function TestKeyIndex:testRemoveExpiredKeysRechecksZeroTTLSlots()
+  luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
+  local i = self.key_index.index["boundary"]
+  local slot = self.key_index.key_prefix .. i
+  self.key_index.expire_keys[i] = 0
+
+  self.dict.ttl = function(_, key)
+    luaunit.assertEquals(key, slot)
+    return 0
+  end
   self.key_index:remove_expired_keys()
   self.dict.ttl = nil
 
-  luaunit.assertEquals(checked, 1)
+  luaunit.assertNotNil(self.key_index.expire_keys[i])
+  self.dict:delete(slot)
+  self.key_index:remove_expired_keys()
+  luaunit.assertNil(self.key_index.keys[i])
+  luaunit.assertNil(self.key_index.index["boundary"])
   luaunit.assertNil(self.key_index.expire_keys[i])
-  luaunit.assertEquals(self.key_index.index["permanent"], i)
-  luaunit.assertEquals(self.dict:get(self.key_index.key_prefix .. i), "permanent")
 end
 
 -- Future deadlines require no shared-dictionary TTL checks.
@@ -1261,9 +1275,11 @@ function TestKeyIndex:testFlushExpiredReleasesTheGuardAfterAnError()
   sleep(2)
 
   ngx.sleep = function() error("API disabled in the current context") end
-  luaunit.assertEquals(self.key_index:flush_expired(), 0)
+  local total, err = self.key_index:flush_expired()
   ngx.sleep = nil
 
+  luaunit.assertEquals(total, batch)
+  luaunit.assertStrContains(err, "API disabled in the current context")
   luaunit.assertEquals(#ngx.logs, 1)
   luaunit.assertStrContains(ngx.logs[1], "failed to reclaim expired entries")
   ngx.logs = nil

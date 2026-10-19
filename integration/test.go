@@ -112,6 +112,16 @@ func checkBucketBoundaries(mfs map[string]*dto.MetricFamily, metric string) erro
 func main() {
 	flag.Parse()
 
+	cleanupClient := &http.Client{Timeout: 10 * time.Second}
+	cleanupResp, err := cleanupClient.Get("http://localhost:18001/test_cleanup")
+	if err != nil {
+		log.Fatalf("Cleanup regression test failed: %v", err)
+	}
+	cleanupResp.Body.Close()
+	if cleanupResp.StatusCode != http.StatusOK {
+		log.Fatalf("Cleanup regression test returned HTTP %d", cleanupResp.StatusCode)
+	}
+
 	// Use a custom http client with a lower idle connection timeout and a request timeout.
 	client := &http.Client{
 		Timeout:   500 * time.Millisecond,
