@@ -746,19 +746,17 @@ function Prometheus.init(dict_name, options_or_prefix)
         and options_or_prefix.remove_expired_keys_interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
         and options_or_prefix.remove_expired_keys_interval
       or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-    self.auto_flush_expired = options_or_prefix.auto_flush_expired ~= false
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
     self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-    self.auto_flush_expired = true
   end
 
   self.registry = {}
   self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
-    self.remove_expired_keys_interval, self.auto_flush_expired)
+    self.remove_expired_keys_interval)
 
   self.initialized = true
 
@@ -936,8 +934,9 @@ end
 -- Reclaims the expired entries of the metrics shared dict, in batches, and
 -- returns how many were reclaimed.
 --
--- Only needed by callers that set auto_flush_expired to false and schedule the
--- reclamation themselves, in a single process instead of in every worker.
+-- Only needed by callers that set remove_expired_keys_interval to 0 or less
+-- and schedule the reclamation themselves, in a single process instead of in
+-- every worker.
 function Prometheus:flush_expired()
   if not self.initialized then
     ngx.log(ngx.ERR, "Prometheus module has not been initialized")

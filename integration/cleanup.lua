@@ -18,11 +18,13 @@ for attempt = 1, 100 do
 
   if ttl == 0 then
     local observed
-    index.dict = {ttl = function(_, name)
+    index.dict = setmetatable({ttl = function(_, name)
       local value, err = d:ttl(name)
       if name == slot then observed = value end
       return value, err
-    end}
+    end}, {__index = function(_, method)
+      return function(_, ...) return d[method](d, ...) end
+    end})
     index:remove_expired_keys()
     index.dict = d
     if observed == 0 then
@@ -60,7 +62,7 @@ for attempt = 1, 100 do
       return value, err
     end}, {__index = function(_, method)
       return function(_, ...) return d[method](d, ...) end
-    end}), index.key_prefix:sub(1, -5), 3600, false)
+    end}), index.key_prefix:sub(1, -5), 0)
     reader:sync()
     local i = reader.index[key]
     if observed == 0 and i then

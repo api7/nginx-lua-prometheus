@@ -1285,22 +1285,27 @@ function TestKeyIndex:testFlushExpiredReleasesTheGuardAfterAnError()
 end
 
 -- Callers that schedule the reclamation themselves, in a single process rather
--- than in every worker, turn the automatic flush off. remove_expired_keys()
--- must then only drop the worker-local references.
-function TestKeyIndex:testAutoFlushExpiredDisabled()
-  local key_index = require('prometheus_keys').new(self.dict, "_noflush_", 1, false)
+-- than in every worker, disable the cleanup timer with a non-positive interval.
+function TestKeyIndex:testNonPositiveIntervalStartsNoCleanupTimer()
+  local at, every = ngx.timer.at, ngx.timer.every
+  -- init() also starts the counter sync timer; count only cleanup timers.
+  local scheduled = 0
+  local function schedule(_, _, context)
+    if type(context) == "table" and context.expire_keys then
+      scheduled = scheduled + 1
+    end
+  end
+  ngx.timer.at, ngx.timer.every = schedule, schedule
+  local key_index = require('prometheus_keys').new(self.dict, "_noflush_", 0)
+  require('prometheus_keys').new(self.dict, "_noflush_", -1)
+  local p = require('prometheus').init("metrics", {remove_expired_keys_interval=0})
+  ngx.timer.at, ngx.timer.every = at, every
+  luaunit.assertEquals(scheduled, 0)
+  luaunit.assertEquals(p.remove_expired_keys_interval, 0)
+
   luaunit.assertEquals(key_index:add("expkey", "eviction_err", 1), nil)
-  -- A metric value key: lives in the same dict, and KeyIndex never reads it.
   self.dict:set("expkey", 1, 1)
-
   sleep(2)
-  key_index:remove_expired_keys()
-
-  luaunit.assertNil(key_index.index["expkey"])
-  -- both entries are still physically present, unlike with the default
-  luaunit.assertNotNil(self.dict.dict["_noflush_key_1"])
-  luaunit.assertNotNil(self.dict.dict["expkey"])
-
   luaunit.assertEquals(key_index:flush_expired(), 2)
   luaunit.assertNil(self.dict.dict["_noflush_key_1"])
   luaunit.assertNil(self.dict.dict["expkey"])

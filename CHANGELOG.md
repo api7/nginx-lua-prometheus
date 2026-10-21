@@ -9,8 +9,9 @@ of changes.
 - Stagger worker cleanup timers, skip slots whose deadlines have not passed,
   and yield between groups of TTL checks (#23).
 - Reclaim expired shared-dictionary entries in batches, prevent overlapping
-  reclamation on the same instance, and add `auto_flush_expired` and
-  `prometheus:flush_expired()` for caller-managed reclamation (#23).
+  reclamation on the same instance, and add `prometheus:flush_expired()` for
+  caller-managed reclamation; `remove_expired_keys_interval` of 0 or less
+  disables the cleanup timer (#23).
 
 ## 1.0.0
 

@@ -117,11 +117,10 @@ section of nginx configuration.
     it. Cleanup checks slots whose recorded deadlines have passed and yields
     between groups of TTL checks. Choose an interval based on dictionary
     capacity and label churn: longer intervals retain more expired entries
-    until reclamation.
-  * `auto_flush_expired` (boolean): whether that reclamation also happens on
-    the interval above, in every worker. Defaults to true. Set it to false to
+    until reclamation. Set it to 0 or less to disable the cleanup timer and
     schedule [`prometheus:flush_expired()`](#prometheusflush_expired) yourself,
-    for instance from a single process.
+    for instance from a single process. Worker-local index entries of expired
+    metrics are then not dropped until a full index sync.
 
 Returns a `prometheus` object that should be used to register metrics.
 
@@ -253,9 +252,9 @@ Returns metric data as an array of strings.
 Reclaims expired shared-dictionary entries and returns the number reclaimed.
 If a batch or pause fails, returns the count reclaimed so far and the error;
 the error is also logged.
-By default, each worker calls this during cleanup. Set `auto_flush_expired`
-to false to schedule reclamation yourself, for example from a single process.
-Worker-local index cleanup still runs when automatic reclamation is disabled.
+By default, each worker calls this during cleanup. Set
+`remove_expired_keys_interval` to 0 or less to schedule reclamation yourself,
+for example from a single process.
 
 Each call frees at most 50,000 entries per batch and runs at most 10 batches,
 yielding for one second between full batches. Remaining expired entries are

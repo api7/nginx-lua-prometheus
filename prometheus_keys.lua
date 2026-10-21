@@ -58,11 +58,9 @@ local function start_remove_expired_keys_timer(self, interval)
 end
 
 
-function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
-                      auto_flush_expired)
+function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   local self = setmetatable({}, KeyIndex)
   self.dict = shared_dict
-  self.auto_flush_expired = auto_flush_expired ~= false
   self.key_prefix = prefix .. "key_"
   self.delete_count = prefix .. "delete_count"
   self.key_count = prefix .. "key_count"
@@ -72,7 +70,11 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   self.index = {}
   self.expire_keys = {}
 
-  start_remove_expired_keys_timer(self, remove_expired_keys_interval or 600)
+  local interval = remove_expired_keys_interval or 600
+  -- A non-positive interval leaves cleanup to the caller.
+  if interval > 0 then
+    start_remove_expired_keys_timer(self, interval)
+  end
   return self
 end
 
@@ -142,12 +144,8 @@ function KeyIndex:remove_expired_keys()
   end
 
   -- The scan above only drops worker-local references, so the expired entries
-  -- still have to be reclaimed from the dict itself. Callers that schedule
-  -- flush_expired() themselves -- in a single process rather than in every
-  -- worker -- turn this off with auto_flush_expired.
-  if self.auto_flush_expired then
-    self:flush_expired()
-  end
+  -- still have to be reclaimed from the dict itself.
+  self:flush_expired()
 end
 
 
