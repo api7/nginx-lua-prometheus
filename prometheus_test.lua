@@ -948,6 +948,9 @@ function TestKeyIndex:testStaleAliasDoesNotHideLiveSlotAfterReclamation()
   self.dict.dict._prefix_key_2.expired = os.time() - 1
   self.dict:set("_prefix_key_count", 2)
   self.key_index:sync()
+  -- a round keeps the expired alias and then flushes it; the next one sees
+  -- it gone
+  self.key_index:remove_expired_keys()
   self.key_index:remove_expired_keys()
   luaunit.assertEquals(self.key_index:list(), {"target"})
   luaunit.assertEquals(self.key_index.index.target, 1)
@@ -1739,6 +1742,9 @@ function TestPrometheus:testKeyTimeout()
 
   sleep(1)
   self.p.key_index:sync()
+  -- the first round keeps the expired node and flushes it, the second one
+  -- finds it reclaimed and drops the reference
+  self.p.key_index:remove_expired_keys()
   self.p.key_index:remove_expired_keys()
   luaunit.assertEquals(self.dict:get("gauge_exp_2"), nil)
   luaunit.assertEquals(self.dict:get("__ngx_prom__key_" .. i), nil)

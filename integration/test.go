@@ -117,7 +117,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Key index regression test failed: %v", err)
 	}
-	indexResp.Body.Close()
+	if err := indexResp.Body.Close(); err != nil {
+		log.Fatalf("Could not close the key index regression response: %v", err)
+	}
 	if indexResp.StatusCode != http.StatusOK {
 		log.Fatalf("Key index regression test returned HTTP %d", indexResp.StatusCode)
 	}

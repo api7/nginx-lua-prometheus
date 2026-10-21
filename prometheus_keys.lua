@@ -48,20 +48,6 @@ end
 
 -- check and remove expired keys
 function KeyIndex:remove_expired_keys()
-  -- The expired shared-dict entries themselves (both the __ngx_prom__key_N
-  -- index slots and the metric value keys, which live in the same dict) are
-  -- only *logically* dead: every dict API treats them as missing, but their
-  -- slab pages stay allocated. The passive per-write expiry scan cannot reclaim
-  -- them either, because it stops at the first non-expired entry at the LRU
-  -- tail, and a permanent entry (the error metric, or any metric registered
-  -- without an exptime) inevitably ends up sitting there. Without this call the
-  -- dict grows without bound under label churn: index slots are never reused,
-  -- so free_space steps down on every new series and never recovers
-  -- (apache/apisix#13658). Reclaiming first means the scan below sees the final state of every slot,
-  -- so a number whose node has just been reclaimed is given up in this round
-  -- rather than the next.
-  self.dict:flush_expired()
-
   for i, _ in pairs(self.expire_keys) do
     -- Keep expired nodes until reclamation: expire() can renew them in place.
     local _, err = self.dict:ttl(self.key_prefix .. i)
@@ -69,6 +55,18 @@ function KeyIndex:remove_expired_keys()
       self:forget_slot(i)
     end
   end
+
+  -- The loop above only drops worker-local references. The expired shared-dict
+  -- entries themselves (both the __ngx_prom__key_N index slots and the metric
+  -- value keys, which live in the same dict) are only *logically* dead: every
+  -- dict API treats them as missing, but their slab pages stay allocated. The
+  -- passive per-write expiry scan cannot reclaim them either, because it stops
+  -- at the first non-expired entry at the LRU tail, and a permanent entry (the
+  -- error metric, or any metric registered without an exptime) inevitably ends
+  -- up sitting there. Without this call the dict grows without bound under
+  -- label churn: index slots are never reused, so free_space steps down on
+  -- every new series and never recovers (apache/apisix#13658).
+  self.dict:flush_expired()
 end
 
 -- Tokens for the generation key (see advance_key_count()), unique per
