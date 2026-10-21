@@ -6,8 +6,6 @@ of changes.
 
 ## Unreleased
 
-- Change the default `remove_expired_keys_interval` from 3600 to 1800 seconds,
-  set its minimum to 20 seconds, and remove the upper bound (#23).
 - Stagger worker cleanup timers, skip slots whose deadlines have not passed,
   and yield between groups of TTL checks (#23).
 - Reclaim expired shared-dictionary entries in batches, prevent overlapping

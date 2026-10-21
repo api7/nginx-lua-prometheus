@@ -92,14 +92,8 @@ local DEFAULT_ERROR_METRIC_NAME = "nginx_metric_errors_total"
 -- Default value for per-worker counter sync interval (seconds).
 local DEFAULT_SYNC_INTERVAL = 1
 
--- Cleanup interval in seconds. Tune for dictionary capacity and label churn.
-local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 1800
-
--- Leave room between rounds for the inter-batch pauses. Dictionary scans and
--- scheduling can take additional time; the re-entry guards handle overlap.
-local MIN_REMOVE_EXPIRED_KEYS_INTERVAL =
-  key_index_lib.FLUSH_EXPIRED_MAX_BATCHES *
-  key_index_lib.FLUSH_EXPIRED_BATCH_DELAY * 2
+-- Max value for check and remove expired keys interval (seconds).
+local MAX_REMOVE_EXPIRED_KEYS_INTERVAL = 3600
 
 -- Default max size of lookup table
 local DEFAULT_LOOKUP_MAX_SIZE = 1000
@@ -748,22 +742,17 @@ function Prometheus.init(dict_name, options_or_prefix)
       DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = options_or_prefix.lookup_max_size or
       DEFAULT_LOOKUP_MAX_SIZE
-    local interval = options_or_prefix.remove_expired_keys_interval
-    if interval and interval < MIN_REMOVE_EXPIRED_KEYS_INTERVAL then
-      ngx.log(ngx.WARN, "remove_expired_keys_interval of ", interval,
-              "s is shorter than the minimum of ",
-              MIN_REMOVE_EXPIRED_KEYS_INTERVAL, "s, using the minimum")
-      interval = MIN_REMOVE_EXPIRED_KEYS_INTERVAL
-    end
-    self.remove_expired_keys_interval =
-      interval or DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.remove_expired_keys_interval = options_or_prefix.remove_expired_keys_interval
+        and options_or_prefix.remove_expired_keys_interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+        and options_or_prefix.remove_expired_keys_interval
+      or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
     self.auto_flush_expired = options_or_prefix.auto_flush_expired ~= false
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
-    self.remove_expired_keys_interval = DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
     self.auto_flush_expired = true
   end
 

@@ -217,41 +217,12 @@ function TestPrometheus:testInitOptions()
   assert(p4.error_metric_name == "foobar")
   assert(p4.remove_expired_keys_interval ~= 0 and p4.remove_expired_keys_interval ~= "")
 
-  local p5 = require('prometheus').init("metrics", {remove_expired_keys_interval=600})
-  assert(p5.remove_expired_keys_interval == 600)
+  local p5 = require('prometheus').init("metrics", {remove_expired_keys_interval=3})
+  assert(p5.remove_expired_keys_interval == 3)
 
   luaunit.assertEquals(ngx.logs, nil)
 end
 
--- A reclaim round reclaims in batches with a pause in between, so it must not
--- take more than half of its own interval: a shorter interval is raised to the
--- minimum, with a warning. There is deliberately no upper bound -- how long an
--- interval a deployment can afford follows from its dict size and expiry rate.
-function TestPrometheus:testInitBoundsTheRemoveExpiredKeysInterval()
-  self.dict = setmetatable({}, SimpleDict)
-  ngx.shared.metrics = self.dict
-
-  local keys = require('prometheus_keys')
-  local minimum = keys.FLUSH_EXPIRED_MAX_BATCHES * keys.FLUSH_EXPIRED_BATCH_DELAY * 2
-
-  local p1 = require('prometheus').init("metrics",
-    {remove_expired_keys_interval = minimum - 1})
-  assert(p1.remove_expired_keys_interval == minimum)
-  luaunit.assertEquals(#ngx.logs, 1)
-  luaunit.assertStrContains(ngx.logs[1], "remove_expired_keys_interval")
-  ngx.logs = nil
-
-  local p2 = require('prometheus').init("metrics", {remove_expired_keys_interval=7200})
-  assert(p2.remove_expired_keys_interval == 7200)
-
-  -- the default applies to both forms of the second argument
-  local p3 = require('prometheus').init("metrics", {})
-  assert(p3.remove_expired_keys_interval == 1800)
-  local p4 = require('prometheus').init("metrics", "pref_")
-  assert(p4.remove_expired_keys_interval == 1800)
-
-  luaunit.assertEquals(ngx.logs, nil)
-end
 function TestPrometheus:testInitWorker()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict

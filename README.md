@@ -113,11 +113,11 @@ section of nginx configuration.
     often. Decreasing this makes sense if you have a very large number of
     metrics or need to minimize memory usage of this library.
   * `remove_expired_keys_interval` (number): cleanup interval in seconds.
-    Defaults to 1800. Values below 20 are raised to 20 with a warning; there
-    is no upper bound. Cleanup checks slots whose recorded deadlines have
-    passed and yields between groups of TTL checks. Choose an interval based
-    on dictionary capacity and label churn: longer intervals retain more
-    expired entries until reclamation.
+    Defaults to 3600, which is also the maximum: larger values are capped to
+    it. Cleanup checks slots whose recorded deadlines have passed and yields
+    between groups of TTL checks. Choose an interval based on dictionary
+    capacity and label churn: longer intervals retain more expired entries
+    until reclamation.
   * `auto_flush_expired` (boolean): whether that reclamation also happens on
     the interval above, in every worker. Defaults to true. Set it to false to
     schedule [`prometheus:flush_expired()`](#prometheusflush_expired) yourself,
