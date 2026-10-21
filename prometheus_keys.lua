@@ -204,10 +204,11 @@ function KeyIndex:sync_range(first, last)
       self.keys[i] = key
       self.index[key] = i
 
-      -- if it is nil and ttl not is 0, record when the slot expires
+      -- record when the slot expires
       if not self.expire_keys[i] then
         local ttl, _ = self.dict:ttl(self.key_prefix .. i)
-        if ttl and ttl ~= 0 then
+        if ttl then
+          -- Zero also occurs at the expiration boundary; keep tracking it.
           self.expire_keys[i] = ngx.now() + ttl
         end
       end

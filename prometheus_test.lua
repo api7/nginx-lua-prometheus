@@ -1066,6 +1066,30 @@ function TestKeyIndex:testRemoveExpiredKeysRechecksZeroTTLSlots()
   luaunit.assertNil(self.key_index.expire_keys[i])
 end
 
+-- A reader that first imports a slot at its exact expiration millisecond reads
+-- a zero TTL as well; it must still drop the slot once it is reclaimed.
+function TestKeyIndex:testSyncTracksSlotsImportedAtZeroTTL()
+  luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
+  local i = self.key_index.index["boundary"]
+  local slot = self.key_index.key_prefix .. i
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+
+  self.dict.ttl = function(_, key)
+    luaunit.assertEquals(key, slot)
+    return 0
+  end
+  reader:sync()
+  self.dict.ttl = nil
+  luaunit.assertEquals(reader.index["boundary"], i)
+  luaunit.assertNotNil(reader.expire_keys[i])
+
+  self.dict:delete(slot)
+  reader:remove_expired_keys()
+  luaunit.assertNil(reader.keys[i])
+  luaunit.assertNil(reader.index["boundary"])
+  luaunit.assertNil(reader.expire_keys[i])
+end
+
 -- Future deadlines require no shared-dictionary TTL checks.
 function TestKeyIndex:testRemoveExpiredKeysSkipsSlotsThatCannotHaveLapsed()
   local keys = {}
