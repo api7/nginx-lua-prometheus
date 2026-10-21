@@ -4,6 +4,12 @@ This file only calls out major changes. Please see [the list of Git commits](
 https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
 
+## Unreleased
+
+- Reuse expired index slots while their dictionary nodes still exist, avoid
+  expiry-driven broadcasts, renew known slots without synchronizing the full
+  index, and detect a re-created `key_count` (#25).
+
 ## 1.0.0
 
 Starting with this release, this fork (`nginx-lua-prometheus-api7`) uses
