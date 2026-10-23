@@ -760,7 +760,8 @@ function Prometheus.init(dict_name, options_or_prefix)
   self.initialized = true
 
   self:counter(self.error_metric_name, "Number of nginx-lua-prometheus errors")
-  self.dict:set(self.error_metric_name, 0)
+  -- init runs in every init_worker, including a respawned worker's
+  self.dict:add(self.error_metric_name, 0)
   local err = self.key_index:add(self.error_metric_name, ERR_MSG_LRU_EVICTION)
   if err then
     self:log_error(err)
