@@ -27,28 +27,32 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.key_prefix = prefix .. "key_"
   self.delete_count = prefix .. "delete_count"
   self.key_count = prefix .. "key_count"
+  self.generation = prefix .. "generation"
   self.last = 0
   self.deleted = 0
-  self.not_expired_index = 1
   self.keys = {}
   self.index = {}
+  self.aliases = {}
   self.expire_keys = {}
 
   ngx.timer.every(remove_expired_keys_interval or 600, remove_expired_keys, self)
   return self
 end
 
+-- ttl() reports a node that expired exactly 5ms ago as "not found" too: the
+-- C function returns expires - now in milliseconds, and -5 is NGX_DECLINED.
+-- Forgetting that node would hide it once expire() revives it in place.
+local function slot_gone(self, i, err)
+  return err == "not found" and self.dict:get_stale(self.key_prefix .. i) == nil
+end
+
 -- check and remove expired keys
 function KeyIndex:remove_expired_keys()
   for i, _ in pairs(self.expire_keys) do
-    -- Read i-th key. If it is nil or ttl is < 0, it means it was expired
-    local ttl, err = self.dict:ttl(self.key_prefix .. i)
-    if not (ttl and ttl >= 0 or err and err ~= "not found") then
-      if self.keys[i] then
-        self.index[self.keys[i]] = nil
-        self.keys[i] = nil
-      end
-      self.expire_keys[i] = nil
+    -- Keep expired nodes until reclamation: expire() can renew them in place.
+    local _, err = self.dict:ttl(self.key_prefix .. i)
+    if slot_gone(self, i, err) then
+      self:forget_slot(i)
     end
   end
 
@@ -61,20 +65,51 @@ function KeyIndex:remove_expired_keys()
   -- error metric, or any metric registered without an exptime) inevitably ends
   -- up sitting there. Without this call the dict grows without bound under
   -- label churn: index slots are never reused, so free_space steps down on
-  -- every new series and never recovers (apache/apisix#13658). Since expired
-  -- entries are indistinguishable from absent ones through every dict API,
-  -- reclaiming them here cannot change any observable behaviour.
+  -- every new series and never recovers (apache/apisix#13658).
   self.dict:flush_expired()
+end
+
+-- Tokens for the generation key (see advance_key_count()), unique per
+-- process: a respawned worker keeps its id, but not its pid.
+local tokens = 0
+local function new_token()
+  tokens = tokens + 1
+  local process = ngx.worker.pid and ngx.worker.pid() or ngx.worker.id()
+  return ngx.now() .. ":" .. tostring(process) .. ":" .. tokens
 end
 
 -- Loads new keys that might have been added by other workers since last sync.
 function KeyIndex:sync()
+  -- The token is read before key_count: a re-creation in between leaves the
+  -- old token recorded, so the next sync still sees it change. The other way
+  -- round, an old key_count paired with the new token hides the re-creation.
+  local generation = self.dict:get(self.generation)
   local delete_count = self.dict:get(self.delete_count) or 0
   local N = self.dict:get(self.key_count) or 0
-  if self.deleted ~= delete_count then
-    -- Some other worker deleted something, lets do a full sync.
+  if self.deleted ~= delete_count or generation == nil
+     or generation ~= self.synced_generation or N < self.last then
+    -- Some other worker deleted something, or key_count was re-created (see
+    -- advance_key_count()), lets do a full sync. A missing token may have
+    -- hidden a re-creation, so publish a new one and read key_count again
+    -- after it: a re-creation after the publish replaces the token, one
+    -- before it shows in the new count. If that fails, the next sync is a
+    -- full one too.
+    if generation == nil then
+      generation = new_token()
+      local ok, err, forcible = self.dict:add(self.generation, generation)
+      if ok then
+        N = self.dict:get(self.key_count) or 0
+      else
+        generation = nil
+      end
+      if err and err ~= "exists" or forcible then
+        ngx.log(ngx.ERR, "key index: publishing the key_count token: ",
+                tostring(err), ", forcible: ", tostring(forcible))
+      end
+    end
     self:sync_range(0, N)
     self.deleted = delete_count
+    self.synced_generation = generation
   elseif N ~= self.last then
     -- Sync only new keys, if there are any.
     self:sync_range(self.last, N)
@@ -85,26 +120,69 @@ end
 -- Iterates keys from first to last, adds new items and removes deleted items.
 function KeyIndex:sync_range(first, last)
   for i = first, last do
-    -- Read i-th key. If it is nil, it means it was deleted by some other thread.
-    local key = self.dict:get(self.key_prefix .. i)
+    -- A writer can revive an expired node without advancing key_count.
+    local key = self.dict:get_stale(self.key_prefix .. i)
     if key then
-      self.keys[i] = key
-      self.index[key] = i
-
-      -- if it is nil and ttl not is 0, set expire_keys map
+      self:remember_slot(i, key)
       if not self.expire_keys[i] then
-        local ttl, _ = self.dict:ttl(self.key_prefix .. i)
-        if ttl and ttl ~= 0 then
+        local ttl, err = self.dict:ttl(self.key_prefix .. i)
+        if ttl then
+          if ttl ~= 0 then
+            self.expire_keys[i] = true
+          end
+        elseif slot_gone(self, i, err) then
+          self:forget_slot(i)
+        else
+          -- Kept at the ttl() sentinel; check it again on the next round.
           self.expire_keys[i] = true
         end
       end
     elseif self.keys[i] then
-      self.index[self.keys[i]] = nil
-      self.keys[i] = nil
-      self.expire_keys[i] = nil
+      self:forget_slot(i)
     end
   end
   self.last = last
+end
+
+
+-- Allocate a reverse set only when concurrent registrations create aliases.
+function KeyIndex:remember_slot(i, key)
+  if self.keys[i] == key then
+    return
+  end
+  if self.keys[i] then
+    self:forget_slot(i)
+  end
+  local previous = self.index[key]
+  if previous then
+    local aliases = self.aliases[key] or {[previous] = true}
+    aliases[i] = true
+    self.aliases[key] = aliases
+  end
+  self.keys[i] = key
+  self.index[key] = i
+end
+
+-- Keep another alias discoverable without scanning the entire local index.
+function KeyIndex:forget_slot(i)
+  local key = self.keys[i]
+  if key then
+    local aliases = self.aliases[key]
+    if aliases then
+      aliases[i] = nil
+      local remaining = next(aliases)
+      if self.index[key] == i then
+        self.index[key] = remaining
+      end
+      if not remaining or next(aliases, remaining) == nil then
+        self.aliases[key] = nil
+      end
+    elseif self.index[key] == i then
+      self.index[key] = nil
+    end
+  end
+  self.keys[i] = nil
+  self.expire_keys[i] = nil
 end
 
 -- Returns array of all keys.
@@ -112,15 +190,9 @@ function KeyIndex:list()
   self:sync()
   local copy = {}
   local i = 1
-  -- Emit a key only from the slot the index currently points at
-  -- (self.index[key] == idx). self.keys can transiently hold the same key value
-  -- in two different slots (e.g. when an expired metric is re-added at a new
-  -- slot before the old slot is reclaimed); listing the raw self.keys values
-  -- would emit duplicate metrics. Consulting the index guarantees each key is
-  -- listed exactly once, at its canonical slot. Iterating self.keys (not
-  -- 0..self.last) keeps this O(live keys): self.last grows monotonically with
-  -- every add and is never reclaimed, so a slot range scan would walk every
-  -- dead slot ever created on long-lived, high-churn workers.
+  -- Emit one slot per name, including retained expired nodes. metric_data()
+  -- filters missing values. Iterating local slots avoids scanning the entire
+  -- monotonically growing key_count range on every scrape.
   for idx, key in pairs(self.keys) do
     if self.index[key] == idx then
       copy[i] = key
@@ -128,6 +200,33 @@ function KeyIndex:list()
     end
   end
   return copy
+end
+
+-- key_count is an ordinary dict node: when it is evicted, the next
+-- registration re-creates it at 1 and the numbers below every worker's
+-- self.last are handed out again, where incremental syncs never look. No
+-- observer can be relied on to notice -- renewals do not sync, and by a
+-- reader's next sync the count may be past its self.last again -- so the
+-- writer that re-creates it tells every worker to do a full sync. Only incr()
+-- with an init creates it, and that is the one call that returns 1. The very
+-- first registration looks the same and costs one full sync of a single slot.
+--
+-- The signal is a token rather than a counter: should it be evicted too, a
+-- re-created counter could land on the very value a worker last saw.
+local function advance_key_count(self)
+  local n, err, forcible = self.dict:incr(self.key_count, 1, 0)
+  if n == 1 then
+    local ok, set_err, set_forcible = self.dict:set(self.generation,
+                                                    new_token())
+    if not ok then
+      ngx.log(ngx.ERR, "failed to broadcast a re-created key_count: ",
+              set_err)
+      -- the old token would hide the re-creation, a missing one cannot
+      self.dict:delete(self.generation)
+    end
+    forcible = forcible or set_forcible
+  end
+  return n, err, forcible
 end
 
 -- Atomically adds one or more keys to the index.
@@ -147,6 +246,24 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     local retried = false
     local repairs = 0
     local repair_forcible = false
+
+    -- The common case by far: this key has a slot and the slot still holds it,
+    -- so only its ttl has to be pushed out. Reading the slot costs one dict
+    -- read where sync() costs two, and none of the shared counters are touched
+    -- -- so nothing another worker does can turn this into a full sync.
+    local mine = self.index[key]
+    if mine and exptime and self.dict:get(self.key_prefix .. mine) == key then
+      local ok, err = self.dict:expire(self.key_prefix .. mine, exptime)
+      if ok then
+        goto renewed
+      end
+      if err ~= "not found" then
+        ngx.log(ngx.ERR, "failed to renew expire for key '", key, "': ",
+                tostring(err))
+        goto renewed
+      end
+    end
+
     while true do
       local N = self:sync()
       if self.index[key] ~= nil then
@@ -156,22 +273,16 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
           local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
           if not ok then
             if err == "not found" then
-              -- The slot already expired in the shared dict. Drop the stale
-              -- local state and bump delete_count so other workers do a full
-              -- sync and reclaim the slot; without this the old slot lingers in
-              -- their local self.keys while the metric is re-added at a new slot,
-              -- desynchronizing the index and causing duplicate metric emission.
-              -- The dict slot is already gone (expire returned "not found"), so
-              -- there is no slot to clear here.
-              local idx = self.index[key]
-              self.index[key] = nil
-              self.keys[idx] = nil
-              self.expire_keys[idx] = nil
-              self.deleted = self.deleted + 1
-              local _, incr_err, forcible = self.dict:incr(self.delete_count, 1, 0)
-              if incr_err or forcible then
-                return incr_err or err_msg_lru_eviction
-              end
+              -- The node is gone, so this number is no longer ours to renew.
+              -- The key takes a fresh slot below, which is above every worker's
+              -- self.last and is therefore picked up by their incremental sync
+              -- -- nothing has to be broadcast, unless key_count was lost,
+              -- which advance_key_count() broadcasts. Bumping
+              -- delete_count here, as this used to, sent every worker through
+              -- a full sync of key_count slots on its request path, and made
+              -- each of them forget every slot that was merely past its ttl,
+              -- so those metrics took new numbers too (apache/apisix#13658).
+              self:forget_slot(self.index[key])
               expired = true
             else
               -- Unexpected expire error: the slot may still be live, so leave it
@@ -196,9 +307,8 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       N = N+1
       local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, exptime)
       if ok then
-        local _, _, forcible2 = self.dict:incr(self.key_count, 1, 0)
-        self.keys[N] = key
-        self.index[key] = N
+        local _, _, forcible2 = advance_key_count(self)
+        self:remember_slot(N, key)
         if exptime and exptime > 0 then
           self.expire_keys[N] = true
         end
@@ -224,7 +334,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       -- occupied slot instead: the next sync() adopts that slot's occupant
       -- and progress resumes.
       if retried then
-        local _, incr_err, forcible3 = self.dict:incr(self.key_count, 1, 0)
+        local _, incr_err, forcible3 = advance_key_count(self)
         if incr_err then
           -- hard failure (e.g. "no memory"): give up immediately, mirroring
           -- the add() error path above, instead of burning the repair budget
@@ -248,6 +358,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       end
       retried = true
     end
+    ::renewed::
   end
 end
 
@@ -258,10 +369,15 @@ end
 function KeyIndex:remove(key, err_msg_lru_eviction)
   local i = self.index[key]
   if i then
-    self.index[key] = nil
-    self.keys[i] = nil
-    self.expire_keys[i] = nil
-    self.dict:set(self.key_prefix .. i, nil)
+    repeat
+      self:forget_slot(i)
+      local slot = self.key_prefix .. i
+      -- Eviction and a counter reset may have reassigned an old alias.
+      if self.dict:get_stale(slot) == key then
+        self.dict:set(slot, nil)
+      end
+      i = self.index[key]
+    until not i
     self.deleted = self.deleted + 1
 
     -- increment delete_count to signalize other workers that they should do a full sync

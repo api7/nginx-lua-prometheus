@@ -112,6 +112,18 @@ func checkBucketBoundaries(mfs map[string]*dto.MetricFamily, metric string) erro
 func main() {
 	flag.Parse()
 
+	indexClient := &http.Client{Timeout: 10 * time.Second}
+	indexResp, err := indexClient.Get("http://localhost:18001/test_index")
+	if err != nil {
+		log.Fatalf("Key index regression test failed: %v", err)
+	}
+	if err := indexResp.Body.Close(); err != nil {
+		log.Fatalf("Could not close the key index regression response: %v", err)
+	}
+	if indexResp.StatusCode != http.StatusOK {
+		log.Fatalf("Key index regression test returned HTTP %d", indexResp.StatusCode)
+	}
+
 	// Use a custom http client with a lower idle connection timeout and a request timeout.
 	client := &http.Client{
 		Timeout:   500 * time.Millisecond,
