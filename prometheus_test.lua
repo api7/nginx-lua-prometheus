@@ -1247,16 +1247,26 @@ function TestKeyIndex:testRemoveExpiredKeysKeepsPermanentSlots()
   luaunit.assertEquals(self.dict:get(slot), "permanent")
 end
 
--- A permanent slot, e.g. renewed with an exptime of 0, is no longer checked.
-function TestKeyIndex:testRemoveExpiredKeysStopsTrackingPermanentSlots()
-  luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 600))
-  local i = self.key_index.index["permanent"]
+-- ttl() also reads 0 at a slot's exact expiry millisecond, so a zero keeps the
+-- slot tracked until its node is reclaimed.
+function TestKeyIndex:testRemoveExpiredKeysRechecksZeroTTLSlots()
+  luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
+  local i = self.key_index.index["boundary"]
+  local slot = self.key_index.key_prefix .. i
   self.key_index.expire_keys[i] = 0
-  luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 0))
 
+  self.dict.ttl = function(_, key)
+    luaunit.assertEquals(key, slot)
+    return 0
+  end
   self.key_index:remove_expired_keys()
-  luaunit.assertNil(self.key_index.expire_keys[i])
-  luaunit.assertEquals(self.key_index.index["permanent"], i)
+  self.dict.ttl = nil
+  luaunit.assertNotNil(self.key_index.expire_keys[i])
+
+  self.dict:delete(slot)
+  self.key_index:remove_expired_keys()
+  luaunit.assertNil(self.key_index.keys[i])
+  luaunit.assertNil(self.key_index.index["boundary"])
 end
 
 -- Metrics registered without an exptime are permanent; the workers that import

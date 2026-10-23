@@ -114,9 +114,6 @@ local function remove_expired_slots(self)
       local ttl, err = self.dict:ttl(self.key_prefix .. i)
       if ttl and ttl > 0 then
         self.expire_keys[i] = now + ttl
-      elseif ttl == 0 then
-        -- Permanent; a slot read at its exact expiry millisecond looks the same.
-        self.expire_keys[i] = nil
       elseif slot_gone(self, i, err) then
         self:forget_slot(i)
       end
