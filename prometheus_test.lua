@@ -1247,48 +1247,26 @@ function TestKeyIndex:testRemoveExpiredKeysKeepsPermanentSlots()
   luaunit.assertEquals(self.dict:get(slot), "permanent")
 end
 
-function TestKeyIndex:testRemoveExpiredKeysRechecksZeroTTLSlots()
-  luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
-  local i = self.key_index.index["boundary"]
-  local slot = self.key_index.key_prefix .. i
+-- A permanent slot, e.g. renewed with an exptime of 0, is no longer checked.
+function TestKeyIndex:testRemoveExpiredKeysStopsTrackingPermanentSlots()
+  luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 600))
+  local i = self.key_index.index["permanent"]
   self.key_index.expire_keys[i] = 0
+  luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 0))
 
-  self.dict.ttl = function(_, key)
-    luaunit.assertEquals(key, slot)
-    return 0
-  end
   self.key_index:remove_expired_keys()
-  self.dict.ttl = nil
-
-  luaunit.assertNotNil(self.key_index.expire_keys[i])
-  self.dict:delete(slot)
-  self.key_index:remove_expired_keys()
-  luaunit.assertNil(self.key_index.keys[i])
-  luaunit.assertNil(self.key_index.index["boundary"])
   luaunit.assertNil(self.key_index.expire_keys[i])
+  luaunit.assertEquals(self.key_index.index["permanent"], i)
 end
 
--- A reader that first imports a slot at its exact expiration millisecond reads
--- a zero TTL as well; it must still drop the slot once it is reclaimed.
-function TestKeyIndex:testSyncTracksSlotsImportedAtZeroTTL()
-  luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
-  local i = self.key_index.index["boundary"]
-  local slot = self.key_index.key_prefix .. i
+-- Metrics registered without an exptime are permanent; the workers that import
+-- their slots must not check them on every round.
+function TestKeyIndex:testSyncDoesNotTrackPermanentSlots()
+  luaunit.assertNil(self.key_index:add("permanent", "eviction_err"))
   local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
-
-  self.dict.ttl = function(_, key)
-    luaunit.assertEquals(key, slot)
-    return 0
-  end
   reader:sync()
-  self.dict.ttl = nil
-  luaunit.assertEquals(reader.index["boundary"], i)
-  luaunit.assertNotNil(reader.expire_keys[i])
-
-  self.dict:delete(slot)
-  reader:remove_expired_keys()
-  luaunit.assertNil(reader.keys[i])
-  luaunit.assertNil(reader.index["boundary"])
+  local i = reader.index["permanent"]
+  luaunit.assertNotNil(i)
   luaunit.assertNil(reader.expire_keys[i])
 end
 
