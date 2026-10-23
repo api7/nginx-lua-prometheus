@@ -58,6 +58,7 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.delete_count = prefix .. "delete_count"
   self.key_count = prefix .. "key_count"
   self.generation = prefix .. "generation"
+  self.flush_marker = prefix .. "flush_expired"
   self.last = 0
   self.deleted = 0
   self.keys = {}
@@ -66,13 +67,10 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.expire_keys = {}
 
   local interval = remove_expired_keys_interval
-    or DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
-  -- A non-positive interval leaves the dict reclamation to the caller. The
-  -- worker-local index still has to be cleaned up by every worker.
-  self.auto_flush = interval > 0
-  if not self.auto_flush then
+  if not interval or interval <= 0 then
     interval = DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
   end
+  self.remove_expired_keys_interval = interval
   start_remove_expired_keys_timer(self, interval)
   return self
 end
@@ -151,7 +149,19 @@ function KeyIndex:remove_expired_keys()
   -- up sitting there. Without this call the dict grows without bound under
   -- label churn: index slots are never reused, so free_space steps down on
   -- every new series and never recovers (apache/apisix#13658).
-  if self.auto_flush then
+  --
+  -- flush_expired() walks the whole dict under its lock, and one call reclaims
+  -- for every worker, so only the first process to finish its local cleanup in
+  -- an interval runs it. The marker expires after the interval and is never
+  -- deleted, so the next interval is open to whichever worker comes first.
+  if ngx.worker.exiting() then
+    return
+  end
+  -- safe_add: add() would force-evict a live entry to store the marker. A dict
+  -- too full to hold it is the one that most needs reclaiming, so flush anyway.
+  local added, add_err = self.dict:safe_add(self.flush_marker, true,
+                                            self.remove_expired_keys_interval)
+  if added or add_err == "no memory" then
     self.dict:flush_expired()
   end
 end

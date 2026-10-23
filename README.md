@@ -117,19 +117,12 @@ section of nginx configuration.
     it. Cleanup checks slots whose recorded deadlines have passed and yields
     between groups of TTL checks. Choose an interval based on dictionary
     capacity and label churn: longer intervals retain more expired entries
-    until reclamation. Set it to 0 or less to stop the workers from
-    reclaiming expired entries and schedule
-    [`prometheus:flush_expired()`](#prometheusflush_expired) yourself, for
-    instance from a single process. Each worker still drops its references to
-    reclaimed entries every 600 seconds, so under label churn it keeps the
-    references created since its last cleanup.
-
-    | Value | Worker-local cleanup | Expired entry reclamation |
-    |---|---|---|
-    | greater than 0 | every `remove_expired_keys_interval` seconds | by every worker, after its local cleanup |
-    | 0 or less | every 600 seconds | by the caller, with `prometheus:flush_expired()` |
-
-    Worker cleanup timers are staggered across workers in both cases.
+    until reclamation. A value of 0 or less is replaced by the default.
+    Worker cleanup timers are staggered across workers. Expired entries are
+    reclaimed once per interval for the whole dictionary, by the first worker
+    to finish its cleanup in that interval: the reclamation holds the
+    dictionary lock while it scans all entries, so its latency grows with the
+    number of entries in the dictionary.
 
 Returns a `prometheus` object that should be used to register metrics.
 
@@ -253,19 +246,6 @@ location /metrics {
 **syntax:** prometheus:metric_data()
 
 Returns metric data as an array of strings.
-
-### prometheus:flush_expired()
-
-**syntax:** prometheus:flush_expired()
-
-Reclaims expired shared-dictionary entries and returns the number reclaimed.
-By default, each worker reclaims expired entries during cleanup. Set
-`remove_expired_keys_interval` to 0 or less to schedule reclamation yourself,
-for example from a single process.
-
-The underlying shared-dictionary operation holds the dictionary lock while it
-scans all entries to find expired ones, so its latency grows with the number
-of entries in the dictionary.
 
 ### counter:inc()
 
