@@ -755,8 +755,7 @@ function Prometheus.init(dict_name, options_or_prefix)
   end
 
   self.registry = {}
-  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
-    self.remove_expired_keys_interval)
+  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX, self.remove_expired_keys_interval)
 
   self.initialized = true
 
@@ -926,13 +925,8 @@ function Prometheus:histogram(name, help, label_names, buckets, exptime)
   return register(self, name, help, label_names, buckets, TYPE_HISTOGRAM, exptime)
 end
 
--- Prometheus compatible metric data as an array of strings.
---
--- Returns:
---   Array of strings with all metrics in a text format compatible with
---   Prometheus.
--- Reclaims the expired entries of the metrics shared dict, in batches, and
--- returns how many were reclaimed.
+-- Reclaims the expired entries of the metrics shared dict and returns how
+-- many were reclaimed.
 --
 -- Only needed by callers that set remove_expired_keys_interval to 0 or less
 -- and schedule the reclamation themselves, in a single process instead of in
@@ -943,9 +937,14 @@ function Prometheus:flush_expired()
     return 0
   end
 
-  return self.key_index:flush_expired()
+  return self.dict:flush_expired()
 end
 
+-- Prometheus compatible metric data as an array of strings.
+--
+-- Returns:
+--   Array of strings with all metrics in a text format compatible with
+--   Prometheus.
 function Prometheus:metric_data()
   if not self.initialized then
     ngx.log(ngx.ERR, "Prometheus module has not been initialized")

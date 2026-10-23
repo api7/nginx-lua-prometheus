@@ -112,12 +112,25 @@ func checkBucketBoundaries(mfs map[string]*dto.MetricFamily, metric string) erro
 func main() {
 	flag.Parse()
 
-	cleanupClient := &http.Client{Timeout: 10 * time.Second}
-	cleanupResp, err := cleanupClient.Get("http://localhost:18001/test_cleanup")
+	indexClient := &http.Client{Timeout: 10 * time.Second}
+	indexResp, err := indexClient.Get("http://localhost:18001/test_index")
+	if err != nil {
+		log.Fatalf("Key index regression test failed: %v", err)
+	}
+	if err := indexResp.Body.Close(); err != nil {
+		log.Fatalf("Could not close the key index regression response: %v", err)
+	}
+	if indexResp.StatusCode != http.StatusOK {
+		log.Fatalf("Key index regression test returned HTTP %d", indexResp.StatusCode)
+	}
+
+	cleanupResp, err := indexClient.Get("http://localhost:18001/test_cleanup")
 	if err != nil {
 		log.Fatalf("Cleanup regression test failed: %v", err)
 	}
-	cleanupResp.Body.Close()
+	if err := cleanupResp.Body.Close(); err != nil {
+		log.Fatalf("Could not close the cleanup regression response: %v", err)
+	}
 	if cleanupResp.StatusCode != http.StatusOK {
 		log.Fatalf("Cleanup regression test returned HTTP %d", cleanupResp.StatusCode)
 	}

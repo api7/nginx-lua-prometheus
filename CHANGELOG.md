@@ -6,12 +6,13 @@ of changes.
 
 ## Unreleased
 
+- Reuse expired index slots while their dictionary nodes still exist, avoid
+  expiry-driven broadcasts, renew known slots without synchronizing the full
+  index, and detect a re-created `key_count` (#25).
 - Stagger worker cleanup timers, skip slots whose deadlines have not passed,
   and yield between groups of TTL checks (#23).
-- Reclaim expired shared-dictionary entries in batches, prevent overlapping
-  reclamation on the same instance, and add `prometheus:flush_expired()` for
-  caller-managed reclamation; `remove_expired_keys_interval` of 0 or less
-  disables the cleanup timer (#23).
+- Add `prometheus:flush_expired()` for caller-managed reclamation;
+  `remove_expired_keys_interval` of 0 or less disables the cleanup timer (#23).
 
 ## 1.0.0
 

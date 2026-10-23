@@ -250,20 +250,13 @@ Returns metric data as an array of strings.
 **syntax:** prometheus:flush_expired()
 
 Reclaims expired shared-dictionary entries and returns the number reclaimed.
-If a batch or pause fails, returns the count reclaimed so far and the error;
-the error is also logged.
 By default, each worker calls this during cleanup. Set
 `remove_expired_keys_interval` to 0 or less to schedule reclamation yourself,
 for example from a single process.
 
-Each call frees at most 50,000 entries per batch and runs at most 10 batches,
-yielding for one second between full batches. Remaining expired entries are
-left for a later call. These limits do not bound runtime: the underlying
-shared-dictionary operation holds the dictionary lock and may scan all entries
-to find expired ones. Actual latency depends on dictionary contents and load.
-
-Concurrent calls on the same instance return 0 while reclamation is running;
-this guard does not coordinate different workers.
+The underlying shared-dictionary operation holds the dictionary lock while it
+scans all entries to find expired ones, so its latency grows with the number
+of entries in the dictionary.
 
 ### counter:inc()
 

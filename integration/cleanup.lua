@@ -68,8 +68,7 @@ for attempt = 1, 100 do
     if observed == 0 and i then
       assert(reader.expire_keys[i] ~= nil, "zero-TTL import was not tracked")
       reader.dict = d
-      local _, err = p:flush_expired()
-      assert(err == nil, err)
+      p:flush_expired()
       reader:remove_expired_keys()
       assert(reader.keys[i] == nil and reader.index[key] == nil,
              "reclaimed import retained its local index")
@@ -82,19 +81,10 @@ assert(imported_boundary, "did not import a slot at the expiration boundary")
 
 p:flush_expired()
 d:set("permanent", 42)
-for i = 1, 50010 do
+for i = 1, 10 do
   assert(d:set("expired_" .. i, i, 0.01))
 end
 ngx.sleep(0.02)
-
-local sleep = ngx.sleep
-ngx.sleep = function() error("injected cleanup pause failure") end
-local total, err = p:flush_expired()
-ngx.sleep = sleep
-assert(total == 50000, "partial reclamation count was lost")
-assert(err and err:find("injected cleanup pause failure", 1, true))
-assert(not index.flushing, "reclamation guard remained set")
-local remaining, retry_err = p:flush_expired()
-assert(remaining == 10 and retry_err == nil, "could not reclaim the remaining entries")
+assert(p:flush_expired() == 10, "did not reclaim the expired entries")
 assert(d:get("permanent") == 42, "permanent entry was reclaimed")
 ngx.say("ok")
