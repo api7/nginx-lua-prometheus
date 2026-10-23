@@ -742,9 +742,15 @@ function Prometheus.init(dict_name, options_or_prefix)
       DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = options_or_prefix.lookup_max_size or
       DEFAULT_LOOKUP_MAX_SIZE
-    self.remove_expired_keys_interval = options_or_prefix.remove_expired_keys_interval
-        and options_or_prefix.remove_expired_keys_interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-        and options_or_prefix.remove_expired_keys_interval
+    local interval = options_or_prefix.remove_expired_keys_interval
+    if interval and interval <= 0 then
+      ngx.log(ngx.WARN, "remove_expired_keys_interval must be positive, using ",
+              MAX_REMOVE_EXPIRED_KEYS_INTERVAL)
+      interval = nil
+    end
+    self.remove_expired_keys_interval = interval
+        and interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+        and interval
       or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
   else
     self.prefix = options_or_prefix or ''

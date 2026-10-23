@@ -112,6 +112,17 @@ section of nginx configuration.
     RAM, you might want to increase this to avoid cache getting flushed too
     often. Decreasing this makes sense if you have a very large number of
     metrics or need to minimize memory usage of this library.
+  * `remove_expired_keys_interval` (number): cleanup interval in seconds.
+    Defaults to 3600, which is also the maximum: larger values are capped to
+    it. Cleanup checks slots whose recorded deadlines have passed and yields
+    between groups of TTL checks. Choose an interval based on dictionary
+    capacity and label churn: longer intervals retain more expired entries
+    until reclamation. A value of 0 or less is replaced by the default.
+    Worker cleanup timers are staggered across workers. Expired entries are
+    reclaimed once per interval for the whole dictionary, by the first worker
+    to finish its cleanup in that interval: the reclamation holds the
+    dictionary lock while it scans all entries, so its latency grows with the
+    number of entries in the dictionary.
 
 Returns a `prometheus` object that should be used to register metrics.
 

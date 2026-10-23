@@ -14,10 +14,40 @@ KeyIndex.__index = KeyIndex
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
 
+local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 600
+
+-- Yield between groups of shared-dictionary TTL checks.
+local REMOVE_EXPIRED_KEYS_YIELD_EVERY = 500
+
+KeyIndex.REMOVE_EXPIRED_KEYS_YIELD_EVERY = REMOVE_EXPIRED_KEYS_YIELD_EVERY
+
 
 -- check and remove expired keys
-local function remove_expired_keys(_, self)
-  self:remove_expired_keys()
+local function remove_expired_keys(premature, self)
+  if not premature then
+    self:remove_expired_keys()
+  end
+end
+
+
+-- Stagger worker cleanup timers to avoid starting every scan together.
+local function start_remove_expired_keys_timer(self, interval)
+  local id = ngx.worker.id() or 0
+  local count = ngx.worker.count()
+
+  local offset = interval * id / count
+  if offset <= 0 then
+    ngx.timer.every(interval, remove_expired_keys, self)
+    return
+  end
+
+  ngx.timer.at(offset, function(premature, s)
+    if premature then
+      return
+    end
+    ngx.timer.every(interval, remove_expired_keys, s)
+    s:remove_expired_keys()
+  end, self)
 end
 
 
@@ -28,6 +58,7 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.delete_count = prefix .. "delete_count"
   self.key_count = prefix .. "key_count"
   self.generation = prefix .. "generation"
+  self.flush_marker = prefix .. "flush_expired"
   self.last = 0
   self.deleted = 0
   self.keys = {}
@@ -35,7 +66,12 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.aliases = {}
   self.expire_keys = {}
 
-  ngx.timer.every(remove_expired_keys_interval or 600, remove_expired_keys, self)
+  local interval = remove_expired_keys_interval
+  if not interval or interval <= 0 then
+    interval = DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
+  end
+  self.remove_expired_keys_interval = interval
+  start_remove_expired_keys_timer(self, interval)
   return self
 end
 
@@ -46,14 +82,61 @@ local function slot_gone(self, i, err)
   return err == "not found" and self.dict:get_stale(self.key_prefix .. i) == nil
 end
 
+-- Drops the worker-local references to the slots that are gone.
+local function remove_expired_slots(self)
+  -- Snapshot due slots before yielding: add() may mutate expire_keys while
+  -- this coroutine is suspended. Future deadlines need no dictionary lookup.
+  local now = ngx.now()
+  local due = {}
+  for i, deadline in pairs(self.expire_keys) do
+    if deadline <= now then
+      due[#due + 1] = i
+    end
+  end
+
+  for j, i in ipairs(due) do
+    if j > 1 and (j - 1) % REMOVE_EXPIRED_KEYS_YIELD_EVERY == 0 then
+      ngx.sleep(0)
+      -- do not hold up a reload: what is left is gone with the worker anyway
+      if ngx.worker.exiting() then
+        return
+      end
+      now = ngx.now()
+    end
+
+    -- re-read: while this round yielded the slot may have been renewed, or
+    -- dropped by add()
+    local deadline = self.expire_keys[i]
+    if deadline and deadline <= now then
+      -- Keep expired nodes until reclamation: expire() can renew them in place.
+      local ttl, err = self.dict:ttl(self.key_prefix .. i)
+      if ttl and ttl > 0 then
+        self.expire_keys[i] = now + ttl
+      elseif slot_gone(self, i, err) then
+        self:forget_slot(i)
+      end
+    end
+  end
+end
+
 -- check and remove expired keys
 function KeyIndex:remove_expired_keys()
-  for i, _ in pairs(self.expire_keys) do
-    -- Keep expired nodes until reclamation: expire() can renew them in place.
-    local _, err = self.dict:ttl(self.key_prefix .. i)
-    if slot_gone(self, i, err) then
-      self:forget_slot(i)
-    end
+  -- A round yields, so the timer can fire again before the previous run
+  -- finished (ngx.timer.every does not wait for it). Two rounds would only ask
+  -- the dict about the same slots twice, so the second one steps aside.
+  if self.removing then
+    return
+  end
+
+  self.removing = true
+  -- pcall so that a throwing ngx.sleep -- a caller reaching this from a phase
+  -- that does not allow yielding -- cannot leave the guard set and stop the
+  -- local scan for the life of the worker.
+  local ok, err = pcall(remove_expired_slots, self)
+  self.removing = false
+
+  if not ok then
+    ngx.log(ngx.ERR, "failed to remove expired keys: ", tostring(err))
   end
 
   -- The loop above only drops worker-local references. The expired shared-dict
@@ -66,7 +149,21 @@ function KeyIndex:remove_expired_keys()
   -- up sitting there. Without this call the dict grows without bound under
   -- label churn: index slots are never reused, so free_space steps down on
   -- every new series and never recovers (apache/apisix#13658).
-  self.dict:flush_expired()
+  --
+  -- flush_expired() walks the whole dict under its lock, and one call reclaims
+  -- for every worker, so only the first process to finish its local cleanup in
+  -- an interval runs it. The marker expires after the interval and is never
+  -- deleted, so the next interval is open to whichever worker comes first.
+  if ngx.worker.exiting() then
+    return
+  end
+  -- safe_add: add() would force-evict a live entry to store the marker. A dict
+  -- too full to hold it is the one that most needs reclaiming, so flush anyway.
+  local added, add_err = self.dict:safe_add(self.flush_marker, true,
+                                            self.remove_expired_keys_interval)
+  if added or add_err == "no memory" then
+    self.dict:flush_expired()
+  end
 end
 
 -- Tokens for the generation key (see advance_key_count()), unique per
@@ -128,13 +225,13 @@ function KeyIndex:sync_range(first, last)
         local ttl, err = self.dict:ttl(self.key_prefix .. i)
         if ttl then
           if ttl ~= 0 then
-            self.expire_keys[i] = true
+            self.expire_keys[i] = ngx.now() + ttl
           end
         elseif slot_gone(self, i, err) then
           self:forget_slot(i)
         else
           -- Kept at the ttl() sentinel; check it again on the next round.
-          self.expire_keys[i] = true
+          self.expire_keys[i] = ngx.now()
         end
       end
     elseif self.keys[i] then
@@ -242,6 +339,10 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     keys = { key_or_keys }
   end
 
+  -- when the slot's expiry is renewed or set below, remember when it lands, so
+  -- that remove_expired_keys() does not have to ask the dict about it
+  local now = exptime and exptime > 0 and ngx.now()
+
   for _, key in pairs(keys) do
     local retried = false
     local repairs = 0
@@ -255,6 +356,9 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
     if mine and exptime and self.dict:get(self.key_prefix .. mine) == key then
       local ok, err = self.dict:expire(self.key_prefix .. mine, exptime)
       if ok then
+        if now then
+          self.expire_keys[mine] = now + exptime
+        end
         goto renewed
       end
       if err ~= "not found" then
@@ -271,6 +375,9 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         local expired = false
         if exptime then
           local ok, err = self.dict:expire(self.key_prefix .. self.index[key], exptime)
+          if ok and now then
+            self.expire_keys[self.index[key]] = now + exptime
+          end
           if not ok then
             if err == "not found" then
               -- The node is gone, so this number is no longer ours to renew.
@@ -309,8 +416,8 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
       if ok then
         local _, _, forcible2 = advance_key_count(self)
         self:remember_slot(N, key)
-        if exptime and exptime > 0 then
-          self.expire_keys[N] = true
+        if now then
+          self.expire_keys[N] = now + exptime
         end
         if forcible or forcible2 or repair_forcible then
           return (err_msg_lru_eviction .. "; key index: add key: idx=" ..

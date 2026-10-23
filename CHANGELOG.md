@@ -9,6 +9,11 @@ of changes.
 - Reuse expired index slots while their dictionary nodes still exist, avoid
   expiry-driven broadcasts, renew known slots without synchronizing the full
   index, and detect a re-created `key_count` (#25).
+- Stagger worker cleanup timers, skip slots whose deadlines have not passed,
+  and yield between groups of TTL checks (#23).
+- Reclaim expired entries once per `remove_expired_keys_interval` for the
+  whole dictionary instead of once per worker; a value of 0 or less falls back
+  to the default (#23).
 
 ## 1.0.0
 
