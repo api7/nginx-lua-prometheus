@@ -11,8 +11,9 @@ of changes.
   index, and detect a re-created `key_count` (#25).
 - Stagger worker cleanup timers, skip slots whose deadlines have not passed,
   and yield between groups of TTL checks (#23).
-- Add `prometheus:flush_expired()` for caller-managed reclamation;
-  `remove_expired_keys_interval` of 0 or less disables the cleanup timer (#23).
+- Add `prometheus:flush_expired()` for caller-managed reclamation; with a
+  `remove_expired_keys_interval` of 0 or less, workers stop reclaiming expired
+  entries and clean up their local index every 600 seconds (#23).
 
 ## 1.0.0
 

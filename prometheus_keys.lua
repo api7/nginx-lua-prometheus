@@ -14,6 +14,8 @@ KeyIndex.__index = KeyIndex
 -- and the index converges even when far more slots need repairing.
 local MAX_KEY_COUNT_REPAIRS = 1000
 
+local DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL = 600
+
 -- Yield between groups of shared-dictionary TTL checks.
 local REMOVE_EXPIRED_KEYS_YIELD_EVERY = 500
 
@@ -63,11 +65,15 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval)
   self.aliases = {}
   self.expire_keys = {}
 
-  local interval = remove_expired_keys_interval or 600
-  -- A non-positive interval leaves cleanup to the caller.
-  if interval > 0 then
-    start_remove_expired_keys_timer(self, interval)
+  local interval = remove_expired_keys_interval
+    or DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
+  -- A non-positive interval leaves the dict reclamation to the caller. The
+  -- worker-local index still has to be cleaned up by every worker.
+  self.auto_flush = interval > 0
+  if not self.auto_flush then
+    interval = DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
   end
+  start_remove_expired_keys_timer(self, interval)
   return self
 end
 
@@ -148,7 +154,9 @@ function KeyIndex:remove_expired_keys()
   -- up sitting there. Without this call the dict grows without bound under
   -- label churn: index slots are never reused, so free_space steps down on
   -- every new series and never recovers (apache/apisix#13658).
-  self.dict:flush_expired()
+  if self.auto_flush then
+    self.dict:flush_expired()
+  end
 end
 
 -- Tokens for the generation key (see advance_key_count()), unique per

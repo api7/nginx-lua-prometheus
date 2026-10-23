@@ -1428,14 +1428,15 @@ function TestKeyIndex:testRemoveExpiredKeysReleasesTheGuardAfterAnError()
 end
 
 -- Callers that schedule the reclamation themselves, in a single process rather
--- than in every worker, disable the cleanup timer with a non-positive interval.
-function TestKeyIndex:testNonPositiveIntervalStartsNoCleanupTimer()
+-- than in every worker, disable it with a non-positive interval. Every worker
+-- still cleans up its local index, on the default interval.
+function TestKeyIndex:testNonPositiveIntervalOnlyDisablesReclamation()
   local at, every = ngx.timer.at, ngx.timer.every
   -- init() also starts the counter sync timer; count only cleanup timers.
-  local scheduled = 0
-  local function schedule(_, _, context)
+  local intervals = {}
+  local function schedule(delay, _, context)
     if type(context) == "table" and context.expire_keys then
-      scheduled = scheduled + 1
+      intervals[#intervals + 1] = delay
     end
   end
   ngx.timer.at, ngx.timer.every = schedule, schedule
@@ -1443,15 +1444,27 @@ function TestKeyIndex:testNonPositiveIntervalStartsNoCleanupTimer()
   require('prometheus_keys').new(self.dict, "_noflush_", -1)
   local p = require('prometheus').init("metrics", {remove_expired_keys_interval=0})
   ngx.timer.at, ngx.timer.every = at, every
-  luaunit.assertEquals(scheduled, 0)
+  luaunit.assertEquals(intervals, {600, 600, 600})
   luaunit.assertEquals(p.remove_expired_keys_interval, 0)
 
   luaunit.assertEquals(key_index:add("expkey", "eviction_err", 1), nil)
   self.dict:set("expkey", 1, 1)
   sleep(2)
+  local flushed = 0
+  self.dict.flush_expired = function(dict)
+    flushed = flushed + 1
+    return SimpleDict.flush_expired(dict)
+  end
+  key_index:remove_expired_keys()
+  luaunit.assertEquals(flushed, 0)
+  -- the expired node is kept until the caller reclaims it
+  luaunit.assertEquals(key_index.index["expkey"], 1)
+
+  self.dict.flush_expired = nil
   luaunit.assertEquals(p:flush_expired(), 2)
-  luaunit.assertNil(self.dict.dict["_noflush_key_1"])
-  luaunit.assertNil(self.dict.dict["expkey"])
+  key_index:remove_expired_keys()
+  luaunit.assertNil(key_index.index["expkey"])
+  luaunit.assertNil(key_index.keys[1])
 end
 
 -- The index slots of a churning metric must not accumulate: each round expires
