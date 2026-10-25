@@ -1476,7 +1476,9 @@ end
 -- enough: the first worker to finish its local cleanup runs it, the others
 -- skip it until the interval has passed.
 function TestKeyIndex:testOneFlushPerInterval()
+  luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
   local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
   local flushes = count_flushes(self.dict)
 
   self.key_index:remove_expired_keys()
@@ -1494,6 +1496,7 @@ end
 -- Storing the marker must not evict a live entry, and a dict too full to hold
 -- it is the one that most needs reclaiming.
 function TestKeyIndex:testFlushWhenTheMarkerDoesNotFit()
+  luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
   local flushes = count_flushes(self.dict)
   self.dict.safe_add = function() return nil, "no memory" end
 
@@ -1507,7 +1510,9 @@ end
 -- A worker on its way out must not take the interval: it could exit before
 -- reclaiming, and no other worker would reclaim until the interval passed.
 function TestKeyIndex:testExitingWorkerLeavesTheFlushToOthers()
+  luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
   local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
   local flushes = count_flushes(self.dict)
   local exiting = ngx.worker.exiting
   ngx.worker.exiting = function() return true end
@@ -1518,6 +1523,36 @@ function TestKeyIndex:testExitingWorkerLeavesTheFlushToOthers()
 
   worker2:remove_expired_keys()
   luaunit.assertEquals(flushes.n, 1)
+  self.dict.flush_expired = nil
+end
+
+-- Without an exptime nothing in the dict expires, so the walk under the dict
+-- lock is skipped, and the interval is left to a worker that has something to
+-- reclaim. Once a worker has seen an expiring entry it keeps reclaiming, even
+-- after the last expiring slot is forgotten: a counter renews its values up to
+-- sync_interval after its slot, so they can outlive it.
+function TestKeyIndex:testFlushOnlyOnceEntriesCanExpire()
+  local flushes = count_flushes(self.dict)
+  luaunit.assertEquals(self.key_index:add("permanent", "eviction_err"), nil)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 0)
+  luaunit.assertNil(self.dict:get("_prefix_flush_expired"))
+
+  -- another worker registers a series that expires; this one learns of it by
+  -- syncing the index
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(worker2:add("expiring", "eviction_err", 1), nil)
+  self.key_index:sync()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 1)
+
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(next(self.key_index.expire_keys), nil)
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 3)
   self.dict.flush_expired = nil
 end
 

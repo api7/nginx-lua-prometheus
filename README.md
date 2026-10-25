@@ -122,7 +122,9 @@ section of nginx configuration.
     reclaimed once per interval for the whole dictionary, by the first worker
     to finish its cleanup in that interval: the reclamation holds the
     dictionary lock while it scans all entries, so its latency grows with the
-    number of entries in the dictionary.
+    number of entries in the dictionary. A worker that has not seen a metric
+    with an `exptime` does not reclaim, so without expiring metrics the
+    dictionary is never scanned.
 
 Returns a `prometheus` object that should be used to register metrics.
 

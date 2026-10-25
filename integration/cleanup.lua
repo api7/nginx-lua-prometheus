@@ -9,10 +9,16 @@ local function set_expired()
   ngx.sleep(0.02)
 end
 
--- start from an interval nobody has reclaimed in yet
+-- no metric has an exptime yet, so the dict lock is not taken to reclaim
 d:delete(marker)
 d:set("permanent", 42)
 set_expired()
+p.key_index:remove_expired_keys()
+assert(d:get_stale("expired_1") ~= nil, "reclaimed without an expiring metric")
+assert(d:get(marker) == nil, "took the interval without an expiring metric")
+
+-- start from an interval nobody has reclaimed in yet
+p:gauge("expiring", "Gauge with an exptime", nil, 3600):set(1)
 p.key_index:remove_expired_keys()
 for i = 1, 10 do
   assert(d:get_stale("expired_" .. i) == nil, "did not reclaim the expired entries")

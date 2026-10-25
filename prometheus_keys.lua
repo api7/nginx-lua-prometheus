@@ -154,7 +154,12 @@ function KeyIndex:remove_expired_keys()
   -- for every worker, so only the first process to finish its local cleanup in
   -- an interval runs it. The marker expires after the interval and is never
   -- deleted, so the next interval is open to whichever worker comes first.
-  if ngx.worker.exiting() then
+  --
+  -- A worker that has never seen an entry with an exptime has nothing to
+  -- reclaim, and must not take the interval from one that has. The flag is
+  -- never cleared: forgetting the last expiring slot does not mean its metric
+  -- values are gone, as counters renew them up to sync_interval later.
+  if not self.has_expiring_entries or ngx.worker.exiting() then
     return
   end
   -- safe_add: add() would force-evict a live entry to store the marker. A dict
@@ -226,12 +231,14 @@ function KeyIndex:sync_range(first, last)
         if ttl then
           if ttl ~= 0 then
             self.expire_keys[i] = ngx.now() + ttl
+            self.has_expiring_entries = true
           end
         elseif slot_gone(self, i, err) then
           self:forget_slot(i)
         else
           -- Kept at the ttl() sentinel; check it again on the next round.
           self.expire_keys[i] = ngx.now()
+          self.has_expiring_entries = true
         end
       end
     elseif self.keys[i] then
@@ -342,6 +349,9 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
   -- when the slot's expiry is renewed or set below, remember when it lands, so
   -- that remove_expired_keys() does not have to ask the dict about it
   local now = exptime and exptime > 0 and ngx.now()
+  if now then
+    self.has_expiring_entries = true
+  end
 
   for _, key in pairs(keys) do
     local retried = false

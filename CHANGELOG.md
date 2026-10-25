@@ -12,8 +12,8 @@ of changes.
 - Stagger worker cleanup timers, skip slots whose deadlines have not passed,
   and yield between groups of TTL checks (#23).
 - Reclaim expired entries once per `remove_expired_keys_interval` for the
-  whole dictionary instead of once per worker; a value of 0 or less falls back
-  to the default (#23).
+  whole dictionary instead of once per worker, and not at all while no metric
+  has an `exptime`; a value of 0 or less falls back to the default (#23).
 
 ## 1.0.0
 
