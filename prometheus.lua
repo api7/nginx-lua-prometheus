@@ -746,19 +746,19 @@ function Prometheus.init(dict_name, options_or_prefix)
       MAX_REMOVE_EXPIRED_KEYS_INTERVAL
     self.remove_expired_keys_interval =
       math.min(interval, MAX_REMOVE_EXPIRED_KEYS_INTERVAL)
-    self.flush_expired = options_or_prefix.flush_expired ~= false
+    self.auto_flush_expired = options_or_prefix.auto_flush_expired ~= false
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
     self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-    self.flush_expired = true
+    self.auto_flush_expired = true
   end
 
   self.registry = {}
   self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
-    self.remove_expired_keys_interval, self.flush_expired)
+    self.remove_expired_keys_interval, self.auto_flush_expired)
 
   self.initialized = true
 

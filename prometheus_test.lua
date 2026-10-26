@@ -1463,7 +1463,7 @@ function TestKeyIndex:testNonPositiveIntervalDisablesCleanup()
   luaunit.assertEquals(intervals, {600, 3600})
   luaunit.assertEquals(p.remove_expired_keys_interval, 0)
   luaunit.assertEquals(capped.remove_expired_keys_interval, 3600)
-  luaunit.assertFalse(zero.flush_expired)
+  luaunit.assertFalse(zero.auto_flush_expired)
 end
 
 local function count_flushes(dict)
@@ -1529,8 +1529,8 @@ function TestKeyIndex:testExitingWorkerLeavesTheFlushToOthers()
   self.dict.flush_expired = nil
 end
 
--- flush_expired = false leaves the reclamation to the caller, but each worker
--- still drops its references to the slots that are gone.
+-- auto_flush_expired = false leaves the reclamation to the caller, but each
+-- worker still drops its references to the slots that are gone.
 function TestKeyIndex:testFlushExpiredDisabledKeepsLocalCleanup()
   local at, every = ngx.timer.at, ngx.timer.every
   local intervals = {}
@@ -1540,12 +1540,12 @@ function TestKeyIndex:testFlushExpiredDisabledKeepsLocalCleanup()
     end
   end
   ngx.timer.at, ngx.timer.every = schedule, schedule
-  local p = require('prometheus').init("metrics", {flush_expired=false})
+  local p = require('prometheus').init("metrics", {auto_flush_expired=false})
   local key_index = require('prometheus_keys').new(self.dict, "_noflush_", 1,
                                                    false)
   ngx.timer.at, ngx.timer.every = at, every
   luaunit.assertEquals(intervals, {3600, 1})
-  luaunit.assertFalse(p.key_index.flush_expired)
+  luaunit.assertFalse(p.key_index.auto_flush_expired)
 
   local flushes = count_flushes(self.dict)
   luaunit.assertEquals(key_index:add("expiring", "eviction_err", 1), nil)

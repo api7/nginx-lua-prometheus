@@ -52,10 +52,10 @@ end
 
 
 -- remove_expired_keys_interval: seconds between cleanup rounds; 0 or less
--- starts no cleanup timer. flush_expired: false leaves dict:flush_expired()
--- to the caller.
+-- starts no cleanup timer. auto_flush_expired: false leaves
+-- dict:flush_expired() to the caller.
 function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
-                      flush_expired)
+                      auto_flush_expired)
   local self = setmetatable({}, KeyIndex)
   self.dict = shared_dict
   self.key_prefix = prefix .. "key_"
@@ -74,7 +74,7 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
     DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
   self.remove_expired_keys_interval = interval
   -- the flush marker expires after the interval, so it needs a positive one
-  self.flush_expired = flush_expired ~= false and interval > 0
+  self.auto_flush_expired = auto_flush_expired ~= false and interval > 0
   if interval > 0 then
     start_remove_expired_keys_timer(self, interval)
   end
@@ -165,7 +165,7 @@ function KeyIndex:remove_expired_keys()
   -- reclaim, and must not take the interval from one that has. The flag is
   -- never cleared: forgetting the last expiring slot does not mean its metric
   -- values are gone, as counters renew them up to sync_interval later.
-  if not self.flush_expired or not self.has_expiring_entries
+  if not self.auto_flush_expired or not self.has_expiring_entries
       or ngx.worker.exiting() then
     return
   end

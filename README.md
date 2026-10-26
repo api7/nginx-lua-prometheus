@@ -126,10 +126,10 @@ section of nginx configuration.
     number of entries in the dictionary. A worker that has not seen a metric
     with an `exptime` does not reclaim, so without expiring metrics the
     dictionary is never scanned.
-  * `flush_expired` (boolean): whether the cleanup reclaims expired entries
-    with `flush_expired()` on the shared dictionary. Defaults to `true`. When
-    `false`, workers still drop their references to expired slots, but
-    expired entries stay in the dictionary until the caller calls
+  * `auto_flush_expired` (boolean): whether the cleanup reclaims expired
+    entries with `flush_expired()` on the shared dictionary. Defaults to
+    `true`. When `false`, workers still drop their references to expired
+    slots, but expired entries stay in the dictionary until the caller calls
     `ngx.shared[dict_name]:flush_expired()`; with metrics that have an
     `exptime`, the dictionary otherwise fills up.
 

@@ -14,8 +14,9 @@ of changes.
 - Reclaim expired entries once per `remove_expired_keys_interval` for the
   whole dictionary instead of once per worker, and not at all while no metric
   has an `exptime` (#23).
-- Add the `flush_expired` option to leave reclamation to the caller, and turn
-  the cleanup off with a `remove_expired_keys_interval` of 0 or less (#23).
+- Add the `auto_flush_expired` option to leave reclamation to the caller, and
+  turn the cleanup off with a `remove_expired_keys_interval` of 0 or less
+  (#23).
 
 ## 1.0.0
 
