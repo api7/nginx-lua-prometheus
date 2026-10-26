@@ -127,7 +127,14 @@ section of nginx configuration.
     dictionary lock while it scans all entries, so its latency grows with the
     number of entries in the dictionary. A worker that has not seen a metric
     with an `exptime` does not reclaim, so without expiring metrics the
-    dictionary is never scanned.
+    dictionary is never scanned. The minimum time between reclamations is
+    kept in the shared dictionary, so it applies to every instance using the
+    dictionary: instances that share one should use the same cleanup
+    settings, as with different intervals the longest one can keep the
+    others from reclaiming at their own. It also survives a reload: after
+    the interval is shortened, the next reclamation waits for what is left
+    of the previous interval. A delayed reclamation keeps expired entries in
+    the dictionary longer, which can lead to evictions when it is full.
   * `auto_flush_expired` (boolean): whether the cleanup reclaims expired
     entries with `flush_expired()` on the shared dictionary. Defaults to
     `true`. When `false`, expired entries stay in the dictionary until the
