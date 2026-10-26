@@ -13,7 +13,9 @@ of changes.
   and yield between groups of TTL checks (#23).
 - Reclaim expired entries once per `remove_expired_keys_interval` for the
   whole dictionary instead of once per worker, and not at all while no metric
-  has an `exptime`; a value of 0 or less falls back to the default (#23).
+  has an `exptime` (#23).
+- Add the `flush_expired` option to leave reclamation to the caller, and turn
+  the cleanup off with a `remove_expired_keys_interval` of 0 or less (#23).
 
 ## 1.0.0
 

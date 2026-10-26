@@ -117,7 +117,8 @@ section of nginx configuration.
     it. Cleanup checks slots whose recorded deadlines have passed and yields
     between groups of TTL checks. Choose an interval based on dictionary
     capacity and label churn: longer intervals retain more expired entries
-    until reclamation. A value of 0 or less is replaced by the default.
+    until reclamation. A value of 0 or less turns the cleanup off: no worker
+    drops its references to expired slots and nothing is reclaimed.
     Worker cleanup timers are staggered across workers. Expired entries are
     reclaimed once per interval for the whole dictionary, by the first worker
     to finish its cleanup in that interval: the reclamation holds the
@@ -125,6 +126,12 @@ section of nginx configuration.
     number of entries in the dictionary. A worker that has not seen a metric
     with an `exptime` does not reclaim, so without expiring metrics the
     dictionary is never scanned.
+  * `flush_expired` (boolean): whether the cleanup reclaims expired entries
+    with `flush_expired()` on the shared dictionary. Defaults to `true`. When
+    `false`, workers still drop their references to expired slots, but
+    expired entries stay in the dictionary until the caller calls
+    `ngx.shared[dict_name]:flush_expired()`; with metrics that have an
+    `exptime`, the dictionary otherwise fills up.
 
 Returns a `prometheus` object that should be used to register metrics.
 

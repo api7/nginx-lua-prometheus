@@ -1441,9 +1441,9 @@ function TestKeyIndex:testRemoveExpiredKeysReleasesTheGuardAfterAnError()
   self.dict.ttl = nil
 end
 
--- A non-positive interval is not a way to turn the cleanup off: it falls back
--- to the default, as a missing one does.
-function TestKeyIndex:testNonPositiveIntervalFallsBackToDefault()
+-- A non-positive interval turns the cleanup off: no timer, so neither the
+-- local cleanup nor the reclamation runs.
+function TestKeyIndex:testNonPositiveIntervalDisablesCleanup()
   local at, every = ngx.timer.at, ngx.timer.every
   -- init() also starts the counter sync timer; count only cleanup timers.
   local intervals = {}
@@ -1453,14 +1453,17 @@ function TestKeyIndex:testNonPositiveIntervalFallsBackToDefault()
     end
   end
   ngx.timer.at, ngx.timer.every = schedule, schedule
-  require('prometheus_keys').new(self.dict, "_zero_", 0)
+  local zero = require('prometheus_keys').new(self.dict, "_zero_", 0)
   require('prometheus_keys').new(self.dict, "_negative_", -1)
+  require('prometheus_keys').new(self.dict, "_default_")
   local p = require('prometheus').init("metrics", {remove_expired_keys_interval=0})
+  local capped = require('prometheus').init("metrics",
+                                            {remove_expired_keys_interval=7200})
   ngx.timer.at, ngx.timer.every = at, every
-  luaunit.assertEquals(intervals, {600, 600, 3600})
-  luaunit.assertEquals(p.remove_expired_keys_interval, 3600)
-  luaunit.assertStrContains(ngx.logs[#ngx.logs],
-                            "remove_expired_keys_interval must be positive")
+  luaunit.assertEquals(intervals, {600, 3600})
+  luaunit.assertEquals(p.remove_expired_keys_interval, 0)
+  luaunit.assertEquals(capped.remove_expired_keys_interval, 3600)
+  luaunit.assertFalse(zero.flush_expired)
 end
 
 local function count_flushes(dict)
@@ -1523,6 +1526,41 @@ function TestKeyIndex:testExitingWorkerLeavesTheFlushToOthers()
 
   worker2:remove_expired_keys()
   luaunit.assertEquals(flushes.n, 1)
+  self.dict.flush_expired = nil
+end
+
+-- flush_expired = false leaves the reclamation to the caller, but each worker
+-- still drops its references to the slots that are gone.
+function TestKeyIndex:testFlushExpiredDisabledKeepsLocalCleanup()
+  local at, every = ngx.timer.at, ngx.timer.every
+  local intervals = {}
+  local function schedule(delay, _, context)
+    if type(context) == "table" and context.expire_keys then
+      intervals[#intervals + 1] = delay
+    end
+  end
+  ngx.timer.at, ngx.timer.every = schedule, schedule
+  local p = require('prometheus').init("metrics", {flush_expired=false})
+  local key_index = require('prometheus_keys').new(self.dict, "_noflush_", 1,
+                                                   false)
+  ngx.timer.at, ngx.timer.every = at, every
+  luaunit.assertEquals(intervals, {3600, 1})
+  luaunit.assertFalse(p.key_index.flush_expired)
+
+  local flushes = count_flushes(self.dict)
+  luaunit.assertEquals(key_index:add("expiring", "eviction_err", 1), nil)
+  local i = key_index.index["expiring"]
+  sleep(2)
+  key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 0)
+  luaunit.assertNil(self.dict:get("_noflush_flush_expired"))
+  luaunit.assertEquals(key_index.keys[i], "expiring")
+
+  -- the caller reclaims; the next round forgets the slot
+  SimpleDict.flush_expired(self.dict)
+  key_index:remove_expired_keys()
+  luaunit.assertNil(key_index.keys[i])
+  luaunit.assertNil(key_index.index["expiring"])
   self.dict.flush_expired = nil
 end
 

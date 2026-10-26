@@ -742,26 +742,23 @@ function Prometheus.init(dict_name, options_or_prefix)
       DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = options_or_prefix.lookup_max_size or
       DEFAULT_LOOKUP_MAX_SIZE
-    local interval = options_or_prefix.remove_expired_keys_interval
-    if interval and interval <= 0 then
-      ngx.log(ngx.WARN, "remove_expired_keys_interval must be positive, using ",
-              MAX_REMOVE_EXPIRED_KEYS_INTERVAL)
-      interval = nil
-    end
-    self.remove_expired_keys_interval = interval
-        and interval < MAX_REMOVE_EXPIRED_KEYS_INTERVAL
-        and interval
-      or MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+    local interval = options_or_prefix.remove_expired_keys_interval or
+      MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.remove_expired_keys_interval =
+      math.min(interval, MAX_REMOVE_EXPIRED_KEYS_INTERVAL)
+    self.flush_expired = options_or_prefix.flush_expired ~= false
   else
     self.prefix = options_or_prefix or ''
     self.error_metric_name = DEFAULT_ERROR_METRIC_NAME
     self.sync_interval = DEFAULT_SYNC_INTERVAL
     self.lookup_max_size = DEFAULT_LOOKUP_MAX_SIZE
     self.remove_expired_keys_interval = MAX_REMOVE_EXPIRED_KEYS_INTERVAL
+    self.flush_expired = true
   end
 
   self.registry = {}
-  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX, self.remove_expired_keys_interval)
+  self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
+    self.remove_expired_keys_interval, self.flush_expired)
 
   self.initialized = true
 
