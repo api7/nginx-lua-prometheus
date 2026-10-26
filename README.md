@@ -128,10 +128,11 @@ section of nginx configuration.
     dictionary is never scanned.
   * `auto_flush_expired` (boolean): whether the cleanup reclaims expired
     entries with `flush_expired()` on the shared dictionary. Defaults to
-    `true`. When `false`, workers still drop their references to expired
-    slots, but expired entries stay in the dictionary until the caller calls
-    `ngx.shared[dict_name]:flush_expired()`; with metrics that have an
-    `exptime`, the dictionary otherwise fills up.
+    `true`. When `false`, expired entries stay in the dictionary until the
+    caller calls `ngx.shared[dict_name]:flush_expired()`, and workers drop
+    their references to expired slots only once the caller has reclaimed
+    them; with metrics that have an `exptime`, the dictionary otherwise fills
+    up.
 
 Returns a `prometheus` object that should be used to register metrics.
 

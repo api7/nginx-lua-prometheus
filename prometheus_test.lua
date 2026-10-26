@@ -155,8 +155,8 @@ function Nginx.now()
   return os.time()
 end
 Nginx.timer = {}
-function Nginx.timer.every(_, _, _) end
-function Nginx.timer.at(_, _, _) end
+function Nginx.timer.every(_, _, _) return true end
+function Nginx.timer.at(_, _, _) return true end
 function Nginx.get_phase()
   return 'init_worker'
 end
@@ -801,7 +801,7 @@ TestKeyIndex = {}
 function TestKeyIndex:setUp()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
-  self.key_index = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  self.key_index = require('prometheus_keys').new(self.dict, "_prefix_", 2)
 end
 function TestKeyIndex.tearDown()
   ngx.logs = nil
@@ -875,7 +875,7 @@ function TestKeyIndex:testExpiredReAddKeepsItsSlot()
   luaunit.assertEquals(self.dict:get("_prefix_key_1"), "expkey")
 
   -- a second worker holds the same slot in its local state
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   worker2:sync()
   luaunit.assertEquals(worker2.index["expkey"], 1)
 
@@ -910,7 +910,7 @@ function TestKeyIndex:testFreshReaderFindsRevivedSlot()
   writer:add("target", "eviction_err", 60)
   writer:add("tail", "eviction_err")
   self.dict.dict._prefix_key_1.expired = os.time() - 1
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   luaunit.assertEquals(reader.last, 2)
   luaunit.assertEquals(writer:add("target", "eviction_err", 60), nil)
@@ -924,7 +924,7 @@ end
 function TestKeyIndex:testReaderFindsRenewalAcrossExpirationBoundary()
   self.key_index:add("target", "eviction_err", 60)
   self.key_index:add("tail", "eviction_err")
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   local injected = false
   self.dict.get = function(dict, key)
     local value = SimpleDict.get(dict, key)
@@ -976,7 +976,7 @@ function TestKeyIndex:testRemoveAllKnownAliases()
   for i = 1, 3 do self.dict:set("_prefix_key_" .. i, "target", 60) end
   self.dict:set("_prefix_key_count", 3)
   self.key_index:sync()
-  local peer = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local peer = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   peer:sync()
   self.key_index:remove("target", "eviction_err")
   luaunit.assertEquals(self.key_index:list(), {})
@@ -995,7 +995,7 @@ function TestKeyIndex:testRemovePreservesReassignedAlias()
   -- Eviction and a counter reset let a fresh writer reuse the lower slot.
   self.dict:delete("_prefix_key_1")
   self.dict:delete("_prefix_key_count")
-  local peer = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local peer = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   luaunit.assertNil(peer:add("replacement", "eviction_err", 60))
   luaunit.assertEquals(peer.index.replacement, 1)
   self.key_index:remove("target", "eviction_err")
@@ -1049,7 +1049,7 @@ function TestKeyIndex:testReclaimedSlotTakesANewOneWithoutBroadcasting()
   for i = 1, 5 do
     luaunit.assertEquals(self.key_index:add("other" .. i, "eviction_err"), nil)
   end
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   worker2:sync()
   luaunit.assertEquals(worker2.index["expkey"], 1)
 
@@ -1165,7 +1165,7 @@ function TestKeyIndex:testSyncTracksSlotsImportedAtTheTtlSentinel()
   luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
   local i = self.key_index.index["boundary"]
   local slot = self.key_index.key_prefix .. i
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
 
   self.dict.ttl = function(_, key)
     luaunit.assertEquals(key, slot)
@@ -1190,9 +1190,11 @@ function TestKeyIndex:testCleanupTimersAreStaggeredByWorker()
   ngx.worker.count = function() return 4 end
   ngx.timer.at = function(delay, callback, context)
     scheduled = {kind="at", delay=delay, callback=callback, context=context}
+    return true
   end
   ngx.timer.every = function(delay, callback, context)
     scheduled = {kind="every", delay=delay, callback=callback, context=context}
+    return true
   end
 
   local cases = {{id=0}, {id=2}, {}}
@@ -1225,6 +1227,7 @@ function TestKeyIndex:testCleanupTimerSkipsPrematureCallbacks()
   local callback, context
   ngx.timer.every = function(_, fn, key_index)
     callback, context = fn, key_index
+    return true
   end
   local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
   ngx.timer.every = every
@@ -1277,7 +1280,7 @@ end
 -- their slots must not check them on every round.
 function TestKeyIndex:testSyncDoesNotTrackPermanentSlots()
   luaunit.assertNil(self.key_index:add("permanent", "eviction_err"))
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   local i = reader.index["permanent"]
   luaunit.assertNotNil(i)
@@ -1441,6 +1444,43 @@ function TestKeyIndex:testRemoveExpiredKeysReleasesTheGuardAfterAnError()
   self.dict.ttl = nil
 end
 
+-- A timer that cannot be created leaves the worker without cleanup, so say so.
+function TestKeyIndex:testCleanupTimerFailureIsLogged()
+  local id, count = ngx.worker.id, ngx.worker.count
+  local at, every = ngx.timer.at, ngx.timer.every
+  local function fail() return nil, "too many pending timers" end
+  local first
+  ngx.worker.count = function() return 2 end
+  ngx.timer.every = fail
+
+  -- worker 0 starts the periodic timer directly
+  require('prometheus_keys').new(self.dict, "_timer_", 60)
+  luaunit.assertEquals(#ngx.logs, 1)
+
+  -- worker 1 cannot start its staggered first round
+  ngx.worker.id = function() return 1 end
+  ngx.timer.at = fail
+  require('prometheus_keys').new(self.dict, "_timer_", 60)
+  luaunit.assertEquals(#ngx.logs, 2)
+
+  -- or starts it, but not the periodic timer from there
+  ngx.timer.at = function(_, callback, context)
+    first = {callback=callback, context=context}
+    return true
+  end
+  local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
+  key_index.remove_expired_keys = function() end
+  first.callback(false, first.context)
+  ngx.worker.id, ngx.worker.count = id, count
+  ngx.timer.at, ngx.timer.every = at, every
+
+  luaunit.assertEquals(#ngx.logs, 3)
+  for _, log in ipairs(ngx.logs) do
+    luaunit.assertStrContains(log, "failed to start the remove expired keys timer")
+    luaunit.assertStrContains(log, "too many pending timers")
+  end
+end
+
 -- A non-positive interval turns the cleanup off: no timer, so neither the
 -- local cleanup nor the reclamation runs.
 function TestKeyIndex:testNonPositiveIntervalDisablesCleanup()
@@ -1451,6 +1491,7 @@ function TestKeyIndex:testNonPositiveIntervalDisablesCleanup()
     if type(context) == "table" and context.expire_keys then
       intervals[#intervals + 1] = delay
     end
+    return true
   end
   ngx.timer.at, ngx.timer.every = schedule, schedule
   local zero = require('prometheus_keys').new(self.dict, "_zero_", 0)
@@ -1480,7 +1521,7 @@ end
 -- skip it until the interval has passed.
 function TestKeyIndex:testOneFlushPerInterval()
   luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   worker2:sync()
   local flushes = count_flushes(self.dict)
 
@@ -1494,6 +1535,27 @@ function TestKeyIndex:testOneFlushPerInterval()
   self.key_index:remove_expired_keys()
   luaunit.assertEquals(flushes.n, 2)
   self.dict.flush_expired = nil
+end
+
+-- The claiming worker's next round comes one interval later, after a local
+-- cleanup that may have yielded; the marker must be gone by then, but outlive
+-- the other workers' rounds in between.
+function TestKeyIndex:testFlushMarkerExpiresBeforeTheNextRound()
+  local count = ngx.worker.count
+  local ttls = {}
+  for _, workers in ipairs({1, 4}) do
+    ngx.worker.count = function() return workers end
+    local key_index = require('prometheus_keys').new(self.dict, "_ttl_", 60)
+    luaunit.assertEquals(key_index:add("expiring", "eviction_err", 3600), nil)
+    self.dict.safe_add = function(_, _, _, exptime)
+      ttls[#ttls + 1] = exptime
+      return true
+    end
+    key_index:remove_expired_keys()
+    self.dict.safe_add = nil
+  end
+  ngx.worker.count = count
+  luaunit.assertEquals(ttls, {30, 52.5})
 end
 
 -- Storing the marker must not evict a live entry, and a dict too full to hold
@@ -1514,7 +1576,7 @@ end
 -- reclaiming, and no other worker would reclaim until the interval passed.
 function TestKeyIndex:testExitingWorkerLeavesTheFlushToOthers()
   luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   worker2:sync()
   local flushes = count_flushes(self.dict)
   local exiting = ngx.worker.exiting
@@ -1538,6 +1600,7 @@ function TestKeyIndex:testFlushExpiredDisabledKeepsLocalCleanup()
     if type(context) == "table" and context.expire_keys then
       intervals[#intervals + 1] = delay
     end
+    return true
   end
   ngx.timer.at, ngx.timer.every = schedule, schedule
   local p = require('prometheus').init("metrics", {auto_flush_expired=false})
@@ -1578,7 +1641,7 @@ function TestKeyIndex:testFlushOnlyOnceEntriesCanExpire()
 
   -- another worker registers a series that expires; this one learns of it by
   -- syncing the index
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   luaunit.assertEquals(worker2:add("expiring", "eviction_err", 1), nil)
   self.key_index:sync()
   self.key_index:remove_expired_keys()
@@ -1660,7 +1723,7 @@ function TestKeyIndex:testAddAfterKeyCountEvictedFreshWorker()
   end
   self.dict:delete("_prefix_key_count")
 
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   local err = worker2:add("newkey", "eviction_err")
   luaunit.assertEquals(err, nil)
   luaunit.assertEquals(self.dict:get("_prefix_key_51"), "newkey")
@@ -1686,7 +1749,7 @@ local function evict_key_count_and_slot(self, slot)
   for i = 1, 100 do
     luaunit.assertEquals(self.key_index:add("key" .. i, "eviction_err", 60), nil)
   end
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   luaunit.assertEquals(reader.last, 100)
   self.dict:delete("_prefix_key_count")
@@ -1754,7 +1817,7 @@ function TestKeyIndex:testReaderFindsSlotReissuedByFreshWorker()
 
   -- a respawned worker: its self.last is 0, so it cannot see key_count going
   -- backwards; only its key_count repair shows it
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   luaunit.assertEquals(fresh:add("key1", "eviction_err", 60), nil)
   luaunit.assertEquals(fresh.index["key1"], 1)
   for i = 1, 150 do
@@ -1771,7 +1834,7 @@ local function evict_key_count_and_all_slots(self)
   for i = 1, 100 do
     luaunit.assertEquals(self.key_index:add("key" .. i, "eviction_err", 60), nil)
   end
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   self.dict:delete("_prefix_key_count")
   for i = 1, 100 do
@@ -1785,7 +1848,7 @@ end
 
 function TestKeyIndex:testReaderFindsContiguousRefillByFreshWorker()
   local reader = evict_key_count_and_all_slots(self)
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   luaunit.assertEquals(fresh:add("key5", "eviction_err", 60), nil)
   luaunit.assertEquals(fresh.index["key5"], 1)
   for i = 1, 120 do
@@ -1801,7 +1864,7 @@ function TestKeyIndex:testRenewalDoesNotTakeOverAReissuedSlot()
   local reader = evict_key_count_and_all_slots(self)
   -- the original writer still maps key5 to slot 5 and only renews, so it
   -- never syncs while key_count is low; a fresh worker refills the holes
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   for i = 1, 120 do
     luaunit.assertEquals(fresh:add("new" .. i, "eviction_err", 60), nil)
   end
@@ -1830,7 +1893,7 @@ end
 -- token leaves the token looking seen, with key_count below self.last.
 function TestKeyIndex:testKeyCountBelowLastForcesAFullSync()
   local reader = evict_key_count_and_all_slots(self)
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   for i = 1, 3 do
     luaunit.assertEquals(fresh:add("new" .. i, "eviction_err", 60), nil)
   end
@@ -1850,7 +1913,7 @@ function TestKeyIndex:testFailedTokenPublishForcesAFullSync()
     if k == "_prefix_generation" then return false, "no memory" end
     return set(d, k, ...)
   end
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   for i = 1, 120 do
     luaunit.assertEquals(fresh:add("new" .. i, "eviction_err", 60), nil)
   end
@@ -1865,7 +1928,7 @@ function TestKeyIndex:testTokenLostTwiceForcesAFullSync()
   for i = 1, 100 do
     luaunit.assertEquals(self.key_index:add("key" .. i, "eviction_err", 60), nil)
   end
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   self.dict:delete("_prefix_generation")
   reader:sync()
@@ -1875,7 +1938,7 @@ function TestKeyIndex:testTokenLostTwiceForcesAFullSync()
   for i = 1, 100 do
     self.dict:delete("_prefix_key_" .. i)
   end
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   for i = 1, 120 do
     luaunit.assertEquals(fresh:add("new" .. i, "eviction_err", 60), nil)
   end
@@ -1890,9 +1953,9 @@ function TestKeyIndex:testOldKeyCountWithNewTokenForcesAFullSync()
   for i = 1, 100 do
     luaunit.assertEquals(self.key_index:add("key" .. i, "eviction_err", 60), nil)
   end
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   local get = SimpleDict.get
   self.dict.get = function(d, k)
     local v = get(d, k)
@@ -1924,10 +1987,10 @@ function TestKeyIndex:testPublishedTokenDoesNotCoverAnOldKeyCount()
   for i = 1, 100 do
     luaunit.assertEquals(self.key_index:add("key" .. i, "eviction_err", 60), nil)
   end
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   self.dict:delete("_prefix_generation")
-  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local fresh = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   self.dict.add = function(d, k, ...)
     if k == "_prefix_generation" then
       d.add = nil
@@ -1971,7 +2034,7 @@ end
 function TestKeyIndex:testTtlSentinelKeepsAPresentNode()
   luaunit.assertEquals(self.key_index:add("key1", "eviction_err", 60), nil)
   luaunit.assertEquals(self.key_index:add("key2", "eviction_err"), nil)
-  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   reader:sync()
   self.dict.dict["_prefix_key_1"].expired = os.time() - 1
   local ttl = SimpleDict.ttl
@@ -2029,7 +2092,7 @@ function TestKeyIndex:testKeyCountRepairReportsForcibleEviction()
   -- a worker with an empty local index registers a key that already exists in
   -- the dict at a slot ahead of the (rewound) counter: the repair crawl adopts
   -- it and exits through the existing-key break.
-  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 2)
   local err = worker2:add("key30", "eviction_err")
   luaunit.assertStrContains(err,
     "eviction_err; key index: adopted key after key_count repair: " ..

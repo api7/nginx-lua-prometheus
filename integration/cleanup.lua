@@ -35,4 +35,25 @@ assert(d:get_stale("expired_1") ~= nil, "reclaimed twice in one interval")
 d:delete(marker)
 p.key_index:remove_expired_keys()
 assert(d:get_stale("expired_1") == nil, "did not reclaim in the next interval")
+
+-- auto_flush_expired = false leaves the reclamation to the caller
+local nd = ngx.shared.cleanup_noflush_metrics
+cleanup_noflush:gauge("expiring", "Gauge with an exptime", nil, 3600):set(1)
+assert(nd:set("expired", 1, 0.01))
+ngx.sleep(0.02)
+cleanup_noflush.key_index:remove_expired_keys()
+assert(nd:get_stale("expired") ~= nil, "reclaimed with auto_flush_expired off")
+assert(nd:get(marker) == nil, "took the interval with auto_flush_expired off")
+
+-- the cleanup timer reclaims on its own, unless the interval turns it off
+local td = ngx.shared.cleanup_timer_metrics
+local od = ngx.shared.cleanup_off_metrics
+for _, p in ipairs({cleanup_timer, cleanup_off}) do
+  p:gauge("expiring", "Gauge with an exptime", nil, 3600):set(1)
+end
+assert(td:set("expired", 1, 0.01))
+assert(od:set("expired", 1, 0.01))
+ngx.sleep(2.5)
+assert(td:get_stale("expired") == nil, "the cleanup timer did not reclaim")
+assert(od:get_stale("expired") ~= nil, "reclaimed with the cleanup turned off")
 ngx.say("ok")

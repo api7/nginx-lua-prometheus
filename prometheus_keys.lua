@@ -30,6 +30,14 @@ local function remove_expired_keys(premature, self)
 end
 
 
+local function run_remove_expired_keys_every(self, interval)
+  local ok, err = ngx.timer.every(interval, remove_expired_keys, self)
+  if not ok then
+    ngx.log(ngx.ERR, "failed to start the remove expired keys timer: ", err)
+  end
+end
+
+
 -- Stagger worker cleanup timers to avoid starting every scan together.
 local function start_remove_expired_keys_timer(self, interval)
   local id = ngx.worker.id() or 0
@@ -37,17 +45,20 @@ local function start_remove_expired_keys_timer(self, interval)
 
   local offset = interval * id / count
   if offset <= 0 then
-    ngx.timer.every(interval, remove_expired_keys, self)
+    run_remove_expired_keys_every(self, interval)
     return
   end
 
-  ngx.timer.at(offset, function(premature, s)
+  local ok, err = ngx.timer.at(offset, function(premature, s)
     if premature then
       return
     end
-    ngx.timer.every(interval, remove_expired_keys, s)
+    run_remove_expired_keys_every(s, interval)
     s:remove_expired_keys()
   end, self)
+  if not ok then
+    ngx.log(ngx.ERR, "failed to start the remove expired keys timer: ", err)
+  end
 end
 
 
@@ -73,6 +84,11 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   local interval = remove_expired_keys_interval or
     DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
   self.remove_expired_keys_interval = interval
+  -- The worker that claims an interval runs its next round one interval
+  -- later, but claims only after its local cleanup, which can yield. Let the
+  -- marker expire half a stagger step early, so that this round can claim
+  -- again, while the other workers' rounds in between still find it.
+  self.flush_marker_ttl = interval - interval / (2 * ngx.worker.count())
   -- the flush marker expires after the interval, so it needs a positive one
   self.auto_flush_expired = auto_flush_expired ~= false and interval > 0
   if interval > 0 then
@@ -158,8 +174,9 @@ function KeyIndex:remove_expired_keys()
   --
   -- flush_expired() walks the whole dict under its lock, and one call reclaims
   -- for every worker, so only the first process to finish its local cleanup in
-  -- an interval runs it. The marker expires after the interval and is never
-  -- deleted, so the next interval is open to whichever worker comes first.
+  -- an interval runs it. The marker expires shortly before the interval ends
+  -- and is never deleted, so the next interval is open to whichever worker
+  -- comes first.
   --
   -- A worker that has never seen an entry with an exptime has nothing to
   -- reclaim, and must not take the interval from one that has. The flag is
@@ -172,7 +189,7 @@ function KeyIndex:remove_expired_keys()
   -- safe_add: add() would force-evict a live entry to store the marker. A dict
   -- too full to hold it is the one that most needs reclaiming, so flush anyway.
   local added, add_err = self.dict:safe_add(self.flush_marker, true,
-                                            self.remove_expired_keys_interval)
+                                            self.flush_marker_ttl)
   if added or add_err == "no memory" then
     self.dict:flush_expired()
   end
