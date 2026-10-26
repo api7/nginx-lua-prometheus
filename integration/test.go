@@ -124,6 +124,17 @@ func main() {
 		log.Fatalf("Key index regression test returned HTTP %d", indexResp.StatusCode)
 	}
 
+	cleanupResp, err := indexClient.Get("http://localhost:18001/test_cleanup")
+	if err != nil {
+		log.Fatalf("Cleanup regression test failed: %v", err)
+	}
+	if err := cleanupResp.Body.Close(); err != nil {
+		log.Fatalf("Could not close the cleanup regression response: %v", err)
+	}
+	if cleanupResp.StatusCode != http.StatusOK {
+		log.Fatalf("Cleanup regression test returned HTTP %d", cleanupResp.StatusCode)
+	}
+
 	// Use a custom http client with a lower idle connection timeout and a request timeout.
 	client := &http.Client{
 		Timeout:   500 * time.Millisecond,

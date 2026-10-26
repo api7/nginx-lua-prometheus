@@ -32,6 +32,10 @@ function SimpleDict:add(k, v, exptime)
   self:set(k, v, exptime)
   return true, nil, forcible  -- ok, err, forcible
 end
+function SimpleDict:safe_add(k, v, exptime)
+  local ok, err = self:add(k, v, exptime)
+  return ok, err
+end
 function SimpleDict:incr(k, v, init)
   local forcible = false
   if k == "willnotfitk" or v == "willnotfitv" or
@@ -137,7 +141,13 @@ function Nginx.print(printed)
 end
 Nginx.worker = {}
 function Nginx.worker.id()
-  return 'testworker'
+  return 0
+end
+function Nginx.worker.count()
+  return 1
+end
+function Nginx.worker.exiting()
+  return false
 end
 function Nginx.sleep() end
 function Nginx.now()
@@ -145,7 +155,8 @@ function Nginx.now()
   return os.time()
 end
 Nginx.timer = {}
-function Nginx.timer.every(_, _, _) end
+function Nginx.timer.every(_, _, _) return true end
+function Nginx.timer.at(_, _, _) return true end
 function Nginx.get_phase()
   return 'init_worker'
 end
@@ -231,6 +242,7 @@ function TestPrometheus:testInitOptions()
 
   luaunit.assertEquals(ngx.logs, nil)
 end
+
 function TestPrometheus:testInitWorker()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
@@ -793,6 +805,9 @@ function TestKeyIndex:setUp()
 end
 function TestKeyIndex.tearDown()
   ngx.logs = nil
+  -- the cleanup tests stub ngx.sleep; drop the stub here too, so a failing
+  -- assertion before their own restore cannot leak it into the next test
+  ngx.sleep = nil
 end
 function TestKeyIndex.testInit()
   luaunit.assertEquals(ngx.logs, nil)
@@ -933,7 +948,7 @@ function TestKeyIndex:testReclaimedCanonicalFallsBackToAlias()
   self.key_index:sync()
   luaunit.assertEquals(self.key_index:list(), {"target"})
   self.dict:delete("_prefix_key_2")
-  self.key_index.expire_keys[2] = true
+  self.key_index.expire_keys[2] = 0
   self.key_index:remove_expired_keys()
   luaunit.assertEquals(self.key_index:list(), {"target"})
   luaunit.assertEquals(self.key_index.index.target, 1)
@@ -1168,6 +1183,482 @@ function TestKeyIndex:testSyncTracksSlotsImportedAtTheTtlSentinel()
   luaunit.assertNil(reader.expire_keys[i])
 end
 
+function TestKeyIndex:testCleanupTimersAreStaggeredByWorker()
+  local id, count = ngx.worker.id, ngx.worker.count
+  local at, every = ngx.timer.at, ngx.timer.every
+  local scheduled
+  ngx.worker.count = function() return 4 end
+  ngx.timer.at = function(delay, callback, context)
+    scheduled = {kind="at", delay=delay, callback=callback, context=context}
+    return true
+  end
+  ngx.timer.every = function(delay, callback, context)
+    scheduled = {kind="every", delay=delay, callback=callback, context=context}
+    return true
+  end
+
+  local cases = {{id=0}, {id=2}, {}}
+  local results = {}
+  for i, case in ipairs(cases) do
+    ngx.worker.id = function() return case.id end
+    local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
+    local calls = 0
+    key_index.remove_expired_keys = function() calls = calls + 1 end
+    local first = scheduled
+    if first.kind == "at" then
+      first.callback(true, first.context)
+      local after_shutdown = calls
+      first.callback(false, first.context)
+      results[i] = {first.kind, first.delay, scheduled.kind, scheduled.delay,
+                    after_shutdown, calls}
+    else
+      results[i] = {first.kind, first.delay}
+    end
+  end
+  ngx.worker.id, ngx.worker.count = id, count
+  ngx.timer.at, ngx.timer.every = at, every
+
+  luaunit.assertEquals(results, {{"every", 60},
+    {"at", 30, "every", 60, 0, 1}, {"every", 60}})
+end
+
+function TestKeyIndex:testCleanupTimerSkipsPrematureCallbacks()
+  local every = ngx.timer.every
+  local callback, context
+  ngx.timer.every = function(_, fn, key_index)
+    callback, context = fn, key_index
+    return true
+  end
+  local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
+  ngx.timer.every = every
+
+  local calls = 0
+  key_index.remove_expired_keys = function() calls = calls + 1 end
+  callback(true, context)
+  luaunit.assertEquals(calls, 0)
+  callback(false, context)
+  luaunit.assertEquals(calls, 1)
+end
+
+function TestKeyIndex:testRemoveExpiredKeysKeepsPermanentSlots()
+  luaunit.assertNil(self.key_index:add("permanent", "eviction_err", 600))
+  local i = self.key_index.index["permanent"]
+  local slot = self.key_index.key_prefix .. i
+  self.dict:set(slot, "permanent")
+  self.key_index.expire_keys[i] = 0
+
+  self.key_index:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+
+  luaunit.assertEquals(self.key_index.index["permanent"], i)
+  luaunit.assertEquals(self.dict:get(slot), "permanent")
+end
+
+-- ttl() also reads 0 at a slot's exact expiry millisecond, so a zero keeps the
+-- slot tracked until its node is reclaimed.
+function TestKeyIndex:testRemoveExpiredKeysRechecksZeroTTLSlots()
+  luaunit.assertNil(self.key_index:add("boundary", "eviction_err", 600))
+  local i = self.key_index.index["boundary"]
+  local slot = self.key_index.key_prefix .. i
+  self.key_index.expire_keys[i] = 0
+
+  self.dict.ttl = function(_, key)
+    luaunit.assertEquals(key, slot)
+    return 0
+  end
+  self.key_index:remove_expired_keys()
+  self.dict.ttl = nil
+  luaunit.assertNotNil(self.key_index.expire_keys[i])
+
+  self.dict:delete(slot)
+  self.key_index:remove_expired_keys()
+  luaunit.assertNil(self.key_index.keys[i])
+  luaunit.assertNil(self.key_index.index["boundary"])
+end
+
+-- Metrics registered without an exptime are permanent; the workers that import
+-- their slots must not check them on every round.
+function TestKeyIndex:testSyncDoesNotTrackPermanentSlots()
+  luaunit.assertNil(self.key_index:add("permanent", "eviction_err"))
+  local reader = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  reader:sync()
+  local i = reader.index["permanent"]
+  luaunit.assertNotNil(i)
+  luaunit.assertNil(reader.expire_keys[i])
+end
+
+-- Future deadlines require no shared-dictionary TTL checks.
+function TestKeyIndex:testRemoveExpiredKeysSkipsSlotsThatCannotHaveLapsed()
+  local keys = {}
+  for i = 1, 100 do
+    keys[i] = "live_" .. i
+  end
+  luaunit.assertEquals(self.key_index:add(keys, "eviction_err", 600), nil)
+
+  local checked = 0
+  local ttl = SimpleDict.ttl
+  self.dict.ttl = function(dict, k)
+    checked = checked + 1
+    return ttl(dict, k)
+  end
+
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(checked, 0)
+  luaunit.assertEquals(self.key_index.index["live_1"], 1)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A renewal on the fast path moves the deadline, and tracks a slot that was
+-- not tracked before.
+function TestKeyIndex:testRenewalRecordsTheNewDeadline()
+  luaunit.assertNil(self.key_index:add("renewed", "eviction_err", 1))
+  local i = self.key_index.index["renewed"]
+  self.key_index.expire_keys[i] = nil
+
+  local sync = self.key_index.sync
+  self.key_index.sync = function() error("renewal must not sync") end
+  luaunit.assertNil(self.key_index:add("renewed", "eviction_err", 600))
+  self.key_index.sync = sync
+
+  luaunit.assertTrue(self.key_index.expire_keys[i] >= ngx.now() + 600)
+end
+
+-- The slots whose deadline has passed do have to be asked about, and there can
+-- be as many of them as the index is large. One round asks about all of them,
+-- so the local index keeps up with the expiry rate, but yields every
+-- REMOVE_EXPIRED_KEYS_YIELD_EVERY of them so the worker keeps serving.
+local function lapse_all_slots(self, prefix, count)
+  local keys = {}
+  for i = 1, count do
+    keys[i] = prefix .. i
+  end
+  luaunit.assertEquals(self.key_index:add(keys, "eviction_err", 600), nil)
+
+  -- what a round running after the exptime sees, without waiting for it: every
+  -- recorded deadline has passed, so every slot has to be asked about
+  for i in pairs(self.key_index.expire_keys) do
+    self.key_index.expire_keys[i] = 0
+  end
+
+  local counter = {checked = 0}
+  local ttl = SimpleDict.ttl
+  self.dict.ttl = function(dict, k)
+    counter.checked = counter.checked + 1
+    return ttl(dict, k)
+  end
+  return counter
+end
+
+function TestKeyIndex:testRemoveExpiredKeysYieldsWhileScanning()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "yield_", 2 * every + 10)
+
+  local yields, checked_at_yield = 0, {}
+  ngx.sleep = function()
+    yields = yields + 1
+    checked_at_yield[yields] = counter.checked
+  end
+  self.key_index:remove_expired_keys()
+  ngx.sleep = nil
+
+  -- every lapsed slot is asked about in this one round, in steps of `every`
+  luaunit.assertEquals(counter.checked, 2 * every + 10)
+  luaunit.assertEquals(checked_at_yield, {every, 2 * every})
+
+  -- the slots are all still live, so they are kept, and their deadlines are
+  -- refreshed rather than re-checked on every round from now on
+  luaunit.assertEquals(self.key_index.index["yield_1"], 1)
+  luaunit.assertEquals(self.key_index.index["yield_" .. (2 * every + 10)],
+                       2 * every + 10)
+  counter.checked = 0
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(counter.checked, 0)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A round yields, so the timer can fire again before it finishes. The second
+-- round must step aside instead of asking the dict about the same slots again.
+function TestKeyIndex:testRemoveExpiredKeysDoesNotOverlap()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "overlap_", every + 10)
+
+  local checked_by_reentry
+  ngx.sleep = function()
+    if checked_by_reentry == nil then
+      local before = counter.checked
+      self.key_index:remove_expired_keys()
+      checked_by_reentry = counter.checked - before
+    end
+  end
+  self.key_index:remove_expired_keys()
+  ngx.sleep = nil
+
+  luaunit.assertEquals(checked_by_reentry, 0)
+  luaunit.assertEquals(counter.checked, every + 10)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A worker that is shutting down stops scanning at the next yield, so it does
+-- not hold up a reload.
+function TestKeyIndex:testRemoveExpiredKeysStopsWhenExiting()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "exiting_", every + 10)
+
+  ngx.worker.exiting = function() return true end
+  self.key_index:remove_expired_keys()
+  ngx.worker.exiting = function() return false end
+
+  luaunit.assertEquals(counter.checked, every)
+
+  self.dict.ttl = nil
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+-- A throwing ngx.sleep -- a caller reaching remove_expired_keys() from a phase
+-- that does not allow yielding -- must not leave the guard set, or the worker
+-- would stop scanning for good.
+function TestKeyIndex:testRemoveExpiredKeysReleasesTheGuardAfterAnError()
+  local every = self.key_index.REMOVE_EXPIRED_KEYS_YIELD_EVERY
+  local counter = lapse_all_slots(self, "error_", every + 10)
+
+  ngx.sleep = function() error("API disabled in the current context") end
+  self.key_index:remove_expired_keys()
+  ngx.sleep = nil
+
+  luaunit.assertEquals(#ngx.logs, 1)
+  luaunit.assertStrContains(ngx.logs[1], "failed to remove expired keys")
+  ngx.logs = nil
+  luaunit.assertEquals(counter.checked, every)
+
+  -- the guard is released, so the next round asks about the rest
+  counter.checked = 0
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(counter.checked, 10)
+
+  self.dict.ttl = nil
+end
+
+-- A timer that cannot be created leaves the worker without cleanup, so say so.
+function TestKeyIndex:testCleanupTimerFailureIsLogged()
+  local id, count = ngx.worker.id, ngx.worker.count
+  local at, every = ngx.timer.at, ngx.timer.every
+  local function fail() return nil, "too many pending timers" end
+  local first
+  ngx.worker.count = function() return 2 end
+  ngx.timer.every = fail
+
+  -- worker 0 starts the periodic timer directly
+  require('prometheus_keys').new(self.dict, "_timer_", 60)
+  luaunit.assertEquals(#ngx.logs, 1)
+
+  -- worker 1 cannot start its staggered first round
+  ngx.worker.id = function() return 1 end
+  ngx.timer.at = fail
+  require('prometheus_keys').new(self.dict, "_timer_", 60)
+  luaunit.assertEquals(#ngx.logs, 2)
+
+  -- or starts it, but not the periodic timer from there
+  ngx.timer.at = function(_, callback, context)
+    first = {callback=callback, context=context}
+    return true
+  end
+  local key_index = require('prometheus_keys').new(self.dict, "_timer_", 60)
+  key_index.remove_expired_keys = function() end
+  first.callback(false, first.context)
+  ngx.worker.id, ngx.worker.count = id, count
+  ngx.timer.at, ngx.timer.every = at, every
+
+  luaunit.assertEquals(#ngx.logs, 3)
+  for _, log in ipairs(ngx.logs) do
+    luaunit.assertStrContains(log, "failed to start the remove expired keys timer")
+    luaunit.assertStrContains(log, "too many pending timers")
+  end
+end
+
+-- A non-positive interval turns the cleanup off: no timer, so neither the
+-- local cleanup nor the reclamation runs.
+function TestKeyIndex:testNonPositiveIntervalDisablesCleanup()
+  local at, every = ngx.timer.at, ngx.timer.every
+  -- init() also starts the counter sync timer; count only cleanup timers.
+  local intervals = {}
+  local function schedule(delay, _, context)
+    if type(context) == "table" and context.expire_keys then
+      intervals[#intervals + 1] = delay
+    end
+    return true
+  end
+  ngx.timer.at, ngx.timer.every = schedule, schedule
+  local zero = require('prometheus_keys').new(self.dict, "_zero_", 0)
+  require('prometheus_keys').new(self.dict, "_negative_", -1)
+  require('prometheus_keys').new(self.dict, "_default_")
+  local p = require('prometheus').init("metrics", {remove_expired_keys_interval=0})
+  local capped = require('prometheus').init("metrics",
+                                            {remove_expired_keys_interval=7200})
+  ngx.timer.at, ngx.timer.every = at, every
+  luaunit.assertEquals(intervals, {600, 3600})
+  luaunit.assertEquals(p.remove_expired_keys_interval, 0)
+  luaunit.assertEquals(capped.remove_expired_keys_interval, 3600)
+  luaunit.assertFalse(zero.auto_flush_expired)
+end
+
+local function count_flushes(dict)
+  local flushes = {n = 0}
+  dict.flush_expired = function(d)
+    flushes.n = flushes.n + 1
+    return SimpleDict.flush_expired(d)
+  end
+  return flushes
+end
+
+-- flush_expired() reclaims for every worker, so one call per interval is
+-- enough: the first worker to finish its local cleanup runs it, the others
+-- skip it until the interval has passed.
+function TestKeyIndex:testOneFlushPerInterval()
+  luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
+  local flushes = count_flushes(self.dict)
+
+  self.key_index:remove_expired_keys()
+  worker2:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 1)
+
+  sleep(2)
+  worker2:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 2)
+  self.dict.flush_expired = nil
+end
+
+-- The marker keeps two reclamations an interval apart, whatever the number of
+-- workers, and is never stored without an expiry: the dict truncates exptime
+-- to milliseconds.
+function TestKeyIndex:testFlushMarkerLastsTheInterval()
+  local count = ngx.worker.count
+  local ttls = {}
+  for _, case in ipairs({{1, 60}, {4, 60}, {1, 0.0005}}) do
+    local workers, interval = case[1], case[2]
+    ngx.worker.count = function() return workers end
+    local key_index = require('prometheus_keys').new(self.dict, "_ttl_",
+                                                     interval)
+    luaunit.assertEquals(key_index:add("expiring", "eviction_err", 3600), nil)
+    self.dict.safe_add = function(_, _, _, exptime)
+      ttls[#ttls + 1] = exptime
+      return true
+    end
+    key_index:remove_expired_keys()
+    self.dict.safe_add = nil
+  end
+  ngx.worker.count = count
+  luaunit.assertEquals(ttls, {60, 60, 0.001})
+end
+
+-- Storing the marker must not evict a live entry, and a dict too full to hold
+-- it is the one that most needs reclaiming.
+function TestKeyIndex:testFlushWhenTheMarkerDoesNotFit()
+  luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
+  local flushes = count_flushes(self.dict)
+  self.dict.safe_add = function() return nil, "no memory" end
+
+  self.key_index:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 2)
+  self.dict.safe_add = nil
+  self.dict.flush_expired = nil
+end
+
+-- A worker on its way out must not take the interval: it could exit before
+-- reclaiming, and no other worker would reclaim until the interval passed.
+function TestKeyIndex:testExitingWorkerLeavesTheFlushToOthers()
+  luaunit.assertEquals(self.key_index:add("expiring", "eviction_err", 3600), nil)
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  worker2:sync()
+  local flushes = count_flushes(self.dict)
+  local exiting = ngx.worker.exiting
+  ngx.worker.exiting = function() return true end
+  self.key_index:remove_expired_keys()
+  ngx.worker.exiting = exiting
+  luaunit.assertEquals(flushes.n, 0)
+  luaunit.assertNil(self.dict:get("_prefix_flush_expired"))
+
+  worker2:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 1)
+  self.dict.flush_expired = nil
+end
+
+-- auto_flush_expired = false leaves the reclamation to the caller, but each
+-- worker still drops its references to the slots that are gone.
+function TestKeyIndex:testFlushExpiredDisabledKeepsLocalCleanup()
+  local at, every = ngx.timer.at, ngx.timer.every
+  local intervals = {}
+  local function schedule(delay, _, context)
+    if type(context) == "table" and context.expire_keys then
+      intervals[#intervals + 1] = delay
+    end
+    return true
+  end
+  ngx.timer.at, ngx.timer.every = schedule, schedule
+  local p = require('prometheus').init("metrics", {auto_flush_expired=false})
+  local key_index = require('prometheus_keys').new(self.dict, "_noflush_", 1,
+                                                   false)
+  ngx.timer.at, ngx.timer.every = at, every
+  luaunit.assertEquals(intervals, {3600, 1})
+  luaunit.assertFalse(p.key_index.auto_flush_expired)
+
+  local flushes = count_flushes(self.dict)
+  luaunit.assertEquals(key_index:add("expiring", "eviction_err", 1), nil)
+  local i = key_index.index["expiring"]
+  sleep(2)
+  key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 0)
+  luaunit.assertNil(self.dict:get("_noflush_flush_expired"))
+  luaunit.assertEquals(key_index.keys[i], "expiring")
+
+  -- the caller reclaims; the next round forgets the slot
+  SimpleDict.flush_expired(self.dict)
+  key_index:remove_expired_keys()
+  luaunit.assertNil(key_index.keys[i])
+  luaunit.assertNil(key_index.index["expiring"])
+  self.dict.flush_expired = nil
+end
+
+-- Without an exptime nothing in the dict expires, so the walk under the dict
+-- lock is skipped, and the interval is left to a worker that has something to
+-- reclaim. Once a worker has seen an expiring entry it keeps reclaiming, even
+-- after the last expiring slot is forgotten: a counter renews its values up to
+-- sync_interval after its slot, so they can outlive it.
+function TestKeyIndex:testFlushOnlyOnceEntriesCanExpire()
+  local flushes = count_flushes(self.dict)
+  luaunit.assertEquals(self.key_index:add("permanent", "eviction_err"), nil)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 0)
+  luaunit.assertNil(self.dict:get("_prefix_flush_expired"))
+
+  -- another worker registers a series that expires; this one learns of it by
+  -- syncing the index
+  local worker2 = require('prometheus_keys').new(self.dict, "_prefix_", 1)
+  luaunit.assertEquals(worker2:add("expiring", "eviction_err", 1), nil)
+  self.key_index:sync()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 1)
+
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(next(self.key_index.expire_keys), nil)
+  sleep(2)
+  self.key_index:remove_expired_keys()
+  luaunit.assertEquals(flushes.n, 3)
+  self.dict.flush_expired = nil
+end
+
 -- The index slots of a churning metric must not accumulate: each round expires
 -- the previous slot, and the reclaim must keep the dict bounded rather than
 -- letting every new series step free space down for good.
@@ -1271,7 +1762,7 @@ end
 function TestKeyIndex:testReaderFindsSlotReissuedAfterKeyCountEviction()
   local reader = evict_key_count_and_slot(self, 5)
   -- the reader's own round finds slot 5 gone and forgets it
-  reader.expire_keys[5] = true
+  reader.expire_keys[5] = 0
   reader:remove_expired_keys()
   luaunit.assertNil(reader.index["key5"])
 
@@ -1282,7 +1773,7 @@ end
 
 function TestKeyIndex:testReaderFindsSlotReissuedAfterKeyCountClimbsBack()
   local reader = evict_key_count_and_slot(self, 5)
-  reader.expire_keys[5] = true
+  reader.expire_keys[5] = 0
   reader:remove_expired_keys()
 
   luaunit.assertEquals(self.key_index:add("key5", "eviction_err", 60), nil)
@@ -1311,7 +1802,7 @@ end
 
 function TestKeyIndex:testReaderFindsLowestSlotReissuedWithoutRepair()
   local reader = evict_key_count_and_slot(self, 1)
-  reader.expire_keys[1] = true
+  reader.expire_keys[1] = 0
   reader:remove_expired_keys()
 
   -- slot 1 is free, so this takes it without any key_count repair, and
@@ -1323,7 +1814,7 @@ end
 
 function TestKeyIndex:testReaderFindsSlotReissuedByFreshWorker()
   local reader = evict_key_count_and_slot(self, 1)
-  reader.expire_keys[1] = true
+  reader.expire_keys[1] = 0
   reader:remove_expired_keys()
 
   -- a respawned worker: its self.last is 0, so it cannot see key_count going
@@ -1350,7 +1841,7 @@ local function evict_key_count_and_all_slots(self)
   self.dict:delete("_prefix_key_count")
   for i = 1, 100 do
     self.dict:delete("_prefix_key_" .. i)
-    reader.expire_keys[i] = true
+    reader.expire_keys[i] = 0
   end
   reader:remove_expired_keys()
   luaunit.assertNil(reader.index["key5"])
@@ -1742,6 +2233,8 @@ function TestPrometheus:testKeyTimeout()
 
   sleep(1)
   self.p.key_index:sync()
+  -- the round above reclaimed for this interval; let the interval pass
+  self.dict:delete("__ngx_prom__flush_expired")
   -- the first round keeps the expired node and flushes it, the second one
   -- finds it reclaimed and drops the reference
   self.p.key_index:remove_expired_keys()

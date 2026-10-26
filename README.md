@@ -112,6 +112,36 @@ section of nginx configuration.
     RAM, you might want to increase this to avoid cache getting flushed too
     often. Decreasing this makes sense if you have a very large number of
     metrics or need to minimize memory usage of this library.
+  * `remove_expired_keys_interval` (number): cleanup interval in seconds.
+    Defaults to 3600, which is also the maximum: larger values are capped to
+    it. Cleanup checks slots whose recorded deadlines have passed and yields
+    between groups of TTL checks. Choose an interval based on dictionary
+    capacity and label churn: longer intervals retain more expired entries
+    until reclamation. A value of 0 or less turns the cleanup off: no worker
+    drops its references to expired slots and nothing is reclaimed.
+    Worker cleanup timers are staggered across workers. The interval is also
+    the minimum time between two reclamations of expired entries for the
+    whole dictionary; each one is run by the first worker to finish its
+    cleanup after the previous one is an interval old, so the time between
+    them can exceed the interval. The reclamation holds the
+    dictionary lock while it scans all entries, so its latency grows with the
+    number of entries in the dictionary. A worker that has not seen a metric
+    with an `exptime` does not reclaim, so without expiring metrics the
+    dictionary is never scanned. The minimum time between reclamations is
+    kept in the shared dictionary, so it applies to every instance using the
+    dictionary: instances that share one should use the same cleanup
+    settings, as with different intervals the longest one can keep the
+    others from reclaiming at their own. It also survives a reload: after
+    the interval is shortened, the next reclamation waits for what is left
+    of the previous interval. A delayed reclamation keeps expired entries in
+    the dictionary longer, which can lead to evictions when it is full.
+  * `auto_flush_expired` (boolean): whether the cleanup reclaims expired
+    entries with `flush_expired()` on the shared dictionary. Defaults to
+    `true`. When `false`, expired entries stay in the dictionary until the
+    caller calls `ngx.shared[dict_name]:flush_expired()`, and workers drop
+    their references to expired slots only once the caller has reclaimed
+    them; with metrics that have an `exptime`, the dictionary otherwise fills
+    up.
 
 Returns a `prometheus` object that should be used to register metrics.
 
