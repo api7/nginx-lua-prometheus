@@ -87,8 +87,10 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   -- The worker that claims an interval runs its next round one interval
   -- later, but claims only after its local cleanup, which can yield. Let the
   -- marker expire half a stagger step early, so that this round can claim
-  -- again, while the other workers' rounds in between still find it.
-  self.flush_marker_ttl = interval - interval / (2 * ngx.worker.count())
+  -- again, while the other workers' rounds in between still find it. The
+  -- dict truncates exptime to milliseconds, and 0 would never expire.
+  self.flush_marker_ttl = math.max(
+    interval - interval / (2 * ngx.worker.count()), 0.001)
   -- the flush marker expires after the interval, so it needs a positive one
   self.auto_flush_expired = auto_flush_expired ~= false and interval > 0
   if interval > 0 then

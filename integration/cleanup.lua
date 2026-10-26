@@ -56,4 +56,20 @@ assert(od:set("expired", 1, 0.01))
 ngx.sleep(2.5)
 assert(td:get_stale("expired") == nil, "the cleanup timer did not reclaim")
 assert(od:get_stale("expired") ~= nil, "reclaimed with the cleanup turned off")
+
+-- the dict truncates exptime to milliseconds; a marker TTL below 1ms would
+-- never expire, and stop reclamation after the first round. The rounds are
+-- run by hand, so the key index starts no timer.
+local sd = ngx.shared.cleanup_tiny_metrics
+local at, every = ngx.timer.at, ngx.timer.every
+ngx.timer.at = function() return true end
+ngx.timer.every = ngx.timer.at
+local tiny = require("prometheus_keys").new(sd, "_tiny_", 0.001)
+ngx.timer.at, ngx.timer.every = at, every
+assert(tiny:add("expiring", "eviction", 3600) == nil)
+tiny:remove_expired_keys()
+assert(sd:set("expired", 1, 0.001))
+ngx.sleep(0.01)
+tiny:remove_expired_keys()
+assert(sd:get_stale("expired") == nil, "the flush marker did not expire")
 ngx.say("ok")

@@ -1539,13 +1539,15 @@ end
 
 -- The claiming worker's next round comes one interval later, after a local
 -- cleanup that may have yielded; the marker must be gone by then, but outlive
--- the other workers' rounds in between.
+-- the other workers' rounds in between, and never be stored without an expiry.
 function TestKeyIndex:testFlushMarkerExpiresBeforeTheNextRound()
   local count = ngx.worker.count
   local ttls = {}
-  for _, workers in ipairs({1, 4}) do
+  for _, case in ipairs({{1, 60}, {4, 60}, {1, 0.001}}) do
+    local workers, interval = case[1], case[2]
     ngx.worker.count = function() return workers end
-    local key_index = require('prometheus_keys').new(self.dict, "_ttl_", 60)
+    local key_index = require('prometheus_keys').new(self.dict, "_ttl_",
+                                                     interval)
     luaunit.assertEquals(key_index:add("expiring", "eviction_err", 3600), nil)
     self.dict.safe_add = function(_, _, _, exptime)
       ttls[#ttls + 1] = exptime
@@ -1555,7 +1557,8 @@ function TestKeyIndex:testFlushMarkerExpiresBeforeTheNextRound()
     self.dict.safe_add = nil
   end
   ngx.worker.count = count
-  luaunit.assertEquals(ttls, {30, 52.5})
+  -- below 1ms the dict would store the marker without an expiry
+  luaunit.assertEquals(ttls, {30, 52.5, 0.001})
 end
 
 -- Storing the marker must not evict a live entry, and a dict too full to hold
