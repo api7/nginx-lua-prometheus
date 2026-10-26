@@ -64,7 +64,7 @@ local sd = ngx.shared.cleanup_tiny_metrics
 local at, every = ngx.timer.at, ngx.timer.every
 ngx.timer.at = function() return true end
 ngx.timer.every = ngx.timer.at
-local tiny = require("prometheus_keys").new(sd, "_tiny_", 0.001)
+local tiny = require("prometheus_keys").new(sd, "_tiny_", 0.0005)
 ngx.timer.at, ngx.timer.every = at, every
 assert(tiny:add("expiring", "eviction", 3600) == nil)
 tiny:remove_expired_keys()

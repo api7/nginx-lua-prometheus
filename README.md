@@ -119,9 +119,11 @@ section of nginx configuration.
     capacity and label churn: longer intervals retain more expired entries
     until reclamation. A value of 0 or less turns the cleanup off: no worker
     drops its references to expired slots and nothing is reclaimed.
-    Worker cleanup timers are staggered across workers. Expired entries are
-    reclaimed once per interval for the whole dictionary, by the first worker
-    to finish its cleanup in that interval: the reclamation holds the
+    Worker cleanup timers are staggered across workers. The interval is also
+    the minimum time between two reclamations of expired entries for the
+    whole dictionary; each one is run by the first worker to finish its
+    cleanup after the previous one is an interval old, so the time between
+    them can exceed the interval. The reclamation holds the
     dictionary lock while it scans all entries, so its latency grows with the
     number of entries in the dictionary. A worker that has not seen a metric
     with an `exptime` does not reclaim, so without expiring metrics the

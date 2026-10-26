@@ -84,13 +84,8 @@ function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
   local interval = remove_expired_keys_interval or
     DEFAULT_REMOVE_EXPIRED_KEYS_INTERVAL
   self.remove_expired_keys_interval = interval
-  -- The worker that claims an interval runs its next round one interval
-  -- later, but claims only after its local cleanup, which can yield. Let the
-  -- marker expire half a stagger step early, so that this round can claim
-  -- again, while the other workers' rounds in between still find it. The
-  -- dict truncates exptime to milliseconds, and 0 would never expire.
-  self.flush_marker_ttl = math.max(
-    interval - interval / (2 * ngx.worker.count()), 0.001)
+  -- The dict truncates exptime to milliseconds, and 0 would never expire.
+  self.flush_marker_ttl = math.max(interval, 0.001)
   -- the flush marker expires after the interval, so it needs a positive one
   self.auto_flush_expired = auto_flush_expired ~= false and interval > 0
   if interval > 0 then
@@ -175,10 +170,10 @@ function KeyIndex:remove_expired_keys()
   -- every new series and never recovers (apache/apisix#13658).
   --
   -- flush_expired() walks the whole dict under its lock, and one call reclaims
-  -- for every worker, so only the first process to finish its local cleanup in
-  -- an interval runs it. The marker expires shortly before the interval ends
-  -- and is never deleted, so the next interval is open to whichever worker
-  -- comes first.
+  -- for every worker, so two reclamations are at least an interval apart: the
+  -- first process to finish its local cleanup after the marker has expired
+  -- runs it. The marker is never deleted. A round that finds it still set
+  -- skips the reclamation, which delays it until a later round.
   --
   -- A worker that has never seen an entry with an exptime has nothing to
   -- reclaim, and must not take the interval from one that has. The flag is
