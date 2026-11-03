@@ -97,10 +97,11 @@ function _M:incr(key, step, exptime)
   step = step or 1
   local value = self.increments[key]
   if value then
-    step = step + value.v
+    value.v = step + value.v
+    value.t = exptime
+  else
+    self.increments[key] = {v = step, t = exptime}
   end
-
-  self.increments[key] = {v = step, t = exptime}
   return true
 end
 
