@@ -4,6 +4,12 @@ This file only calls out major changes. Please see [the list of Git commits](
 https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
 
+## 1.1.1
+
+- Update a metric's pending increment in place instead of allocating a new
+  entry on every `incr()` before `sync()`, which removes the per-call
+  allocation for counters and histogram observations (#28).
+
 ## 1.1.0
 
 - Reuse expired index slots while their dictionary nodes still exist, avoid
