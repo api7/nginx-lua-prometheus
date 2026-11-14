@@ -443,7 +443,7 @@ function KeyIndex:add(key_or_keys, err_msg_lru_eviction, exptime)
         end
       end
       N = N+1
-      local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, exptime)
+      local ok, err, forcible = self.dict:add(self.key_prefix .. N, key, nil)
       if ok then
         local _, _, forcible2 = advance_key_count(self)
         self:remember_slot(N, key)
