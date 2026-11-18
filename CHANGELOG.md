@@ -4,7 +4,7 @@ This file only calls out major changes. Please see [the list of Git commits](
 https://github.com/api7/nginx-lua-prometheus/commits/main) for the full list
 of changes.
 
-## 1.1.2
+## 1.2.0
 
 - Accept an optional `error_metric_labels` map in `metric_data()` and
   `collect()` to label the built-in error metric on output. Errors are still
