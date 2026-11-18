@@ -928,15 +928,56 @@ function Prometheus:histogram(name, help, label_names, buckets, exptime)
   return register(self, name, help, label_names, buckets, TYPE_HISTOGRAM, exptime)
 end
 
+local function error_metric_full_name(name, labels)
+  if type(labels) ~= "table" then
+    return nil, "error_metric_labels must be a table"
+  end
+  local names = {}
+  for key, value in pairs(labels) do
+    if type(key) ~= "string" then
+      return nil, "error_metric_labels keys must be strings"
+    end
+    local typ = type(value)
+    if typ ~= "string" and typ ~= "number" and typ ~= "boolean" then
+      return nil, "invalid error metric label value for " .. key
+    end
+    names[#names + 1] = key
+  end
+  if #names == 0 then
+    return name
+  end
+  local err = check_metric_and_label_names(name, names)
+  if err then
+    return nil, err
+  end
+  table.sort(names)
+  local values = {}
+  for i, key in ipairs(names) do
+    values[i] = labels[key]
+  end
+  return full_metric_name(name, names, values)
+end
+
 -- Prometheus compatible metric data as an array of strings.
 --
 -- Returns:
 --   Array of strings with all metrics in a text format compatible with
 --   Prometheus.
-function Prometheus:metric_data()
+function Prometheus:metric_data(options)
   if not self.initialized then
     ngx.log(ngx.ERR, "Prometheus module has not been initialized")
     return
+  end
+
+  local error_name = self.error_metric_name
+  if type(options) == "table" and options.error_metric_labels ~= nil then
+    local name, err = error_metric_full_name(error_name, options.error_metric_labels)
+    if err then
+      -- counted before the dict is read below, so this output includes it
+      self:log_error(err)
+    else
+      error_name = name
+    end
   end
 
   -- Force a manual sync of counter local state (mostly to make tests work).
@@ -969,7 +1010,11 @@ function Prometheus:metric_data()
         end
         seen_metrics[short_name] = true
       end
-      key = fix_histogram_bucket_labels(key)
+      if key == self.error_metric_name then
+        key = error_name
+      else
+        key = fix_histogram_bucket_labels(key)
+      end
       table_insert_tail(output, string.format("%s%s %s\n", self.prefix, key, value))
     else
       if type(err) == "string" then
@@ -985,9 +1030,9 @@ end
 -- This function should be used to expose the metrics on a separate HTTP page.
 -- It will get the metrics from the dictionary, sort them, and expose them
 -- aling with TYPE and HELP comments.
-function Prometheus:collect()
+function Prometheus:collect(options)
   ngx.header.content_type = "text/plain"
-  ngx.print(self:metric_data())
+  ngx.print(self:metric_data(options))
 end
 
 -- Log an error, incrementing the error counter.

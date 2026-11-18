@@ -244,12 +244,13 @@ init_worker_by_lua_block {
 
 ### prometheus:collect()
 
-**syntax:** prometheus:collect()
+**syntax:** prometheus:collect(*options*)
 
 Presents all metrics in a text format compatible with Prometheus. This should be
 called in
 [content_by_lua_block](https://github.com/openresty/lua-nginx-module#content_by_lua_block)
-to expose the metrics on a separate HTTP page.
+to expose the metrics on a separate HTTP page. Accepts the same optional
+argument as [metric_data()](#prometheusmetric_data).
 
 Example:
 ```nginx
@@ -262,9 +263,13 @@ location /metrics {
 
 ### prometheus:metric_data()
 
-**syntax:** prometheus:metric_data()
+**syntax:** prometheus:metric_data(*options*)
 
-Returns metric data as an array of strings.
+Returns metric data as an array of strings. The optional `options.error_metric_labels`
+table maps label names to string, number, or boolean values for the built-in error
+metric on this call. An omitted or empty map emits the bare error metric. An
+invalid label map is logged and counted as an error, and the bare error metric is
+emitted.
 
 ### counter:inc()
 
@@ -410,6 +415,19 @@ The module increments an error metric called `nginx_metric_errors_total`
 (unless another name was configured in [init()](#init)) if it encounters
 an error (for example, when `lua_shared_dict` becomes full). You might want
 to configure an alert on that metric.
+
+The error metric can carry labels, for example to tell instances apart when
+their metrics are merged:
+
+```lua
+prometheus:collect({
+  error_metric_labels = {group = group_id, instance_id = instance_id},
+})
+```
+
+The labels are only added on output: errors are still counted under the bare
+metric name, so counting an error never needs a new key in the shared
+dictionary.
 
 ## Caveats
 

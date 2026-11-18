@@ -243,6 +243,52 @@ function TestPrometheus:testInitOptions()
   luaunit.assertEquals(ngx.logs, nil)
 end
 
+function TestPrometheus:testErrorMetricLabels()
+  local p = require('prometheus').init("metrics", {
+    prefix = "pre_", error_metric_name = "errors_total",
+  })
+  p:counter("requests", "Requests"):inc(3)
+  p:log_error("boom")
+  ngx.logs = nil
+
+  local output = table.concat(p:metric_data({
+    error_metric_labels = {instance = 'i"1', group = 12},
+  }))
+  luaunit.assertStrContains(output, "# TYPE pre_errors_total counter\n")
+  luaunit.assertStrContains(output, 'pre_errors_total{group="12",instance="i\\"1"} 1\n')
+  luaunit.assertStrContains(output, "\npre_requests 3\n")
+  luaunit.assertNotStrContains(output, "pre_errors_total 1")
+
+  ngx.printed = nil
+  p:collect({error_metric_labels = {active = false}})
+  luaunit.assertNotNil(find_idx(ngx.printed, 'pre_errors_total{active="false"} 1'))
+  local bare = table.concat(p:metric_data())
+  luaunit.assertStrContains(bare, "\npre_errors_total 1\n")
+  luaunit.assertEquals(table.concat(p:metric_data({error_metric_labels = {}})), bare)
+  luaunit.assertEquals(self.dict:get("errors_total"), 1)
+  luaunit.assertEquals(ngx.logs, nil)
+end
+
+function TestPrometheus:testInvalidErrorMetricLabels()
+  self.counter1:inc(3)
+  local cases = {
+    {false, "must be a table"},
+    {{"value"}, "keys must be strings"},
+    {{["bad-name"] = "value"}, "label name 'bad-name' is invalid"},
+    {{le = "value"}, "Invalid label name 'le'"},
+    {{instance = {}}, "invalid error metric label value for instance"},
+  }
+  for i, case in ipairs(cases) do
+    ngx.logs = nil
+    local output = table.concat(self.p:metric_data({error_metric_labels = case[1]}))
+    -- counted as an error, and visible in the same output
+    luaunit.assertStrContains(output, "\nnginx_metric_errors_total " .. i .. "\n")
+    luaunit.assertStrContains(output, "\nmetric1 3\n")
+    luaunit.assertEquals(#ngx.logs, 1)
+    luaunit.assertStrContains(ngx.logs[1], case[2])
+  end
+end
+
 function TestPrometheus:testInitWorker()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
