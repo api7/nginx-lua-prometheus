@@ -278,10 +278,11 @@ function TestPrometheus:testInvalidErrorMetricLabels()
     {{le = "value"}, "Invalid label name 'le'"},
     {{instance = {}}, "invalid error metric label value for instance"},
   }
-  for _, case in ipairs(cases) do
+  for i, case in ipairs(cases) do
     ngx.logs = nil
     local output = table.concat(self.p:metric_data({error_metric_labels = case[1]}))
-    luaunit.assertStrContains(output, "\nnginx_metric_errors_total 0\n")
+    -- counted as an error, and visible in the same output
+    luaunit.assertStrContains(output, "\nnginx_metric_errors_total " .. i .. "\n")
     luaunit.assertStrContains(output, "\nmetric1 3\n")
     luaunit.assertEquals(#ngx.logs, 1)
     luaunit.assertStrContains(ngx.logs[1], case[2])

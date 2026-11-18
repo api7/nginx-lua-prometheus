@@ -268,7 +268,8 @@ location /metrics {
 Returns metric data as an array of strings. The optional `options.error_metric_labels`
 table maps label names to string, number, or boolean values for the built-in error
 metric on this call. An omitted or empty map emits the bare error metric. An
-invalid label map is logged and the bare error metric is emitted.
+invalid label map is logged and counted as an error, and the bare error metric is
+emitted.
 
 ### counter:inc()
 

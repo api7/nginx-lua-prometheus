@@ -973,7 +973,8 @@ function Prometheus:metric_data(options)
   if type(options) == "table" and options.error_metric_labels ~= nil then
     local name, err = error_metric_full_name(error_name, options.error_metric_labels)
     if err then
-      ngx.log(ngx.ERR, err)
+      -- counted before the dict is read below, so this output includes it
+      self:log_error(err)
     else
       error_name = name
     end
