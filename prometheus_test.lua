@@ -581,6 +581,129 @@ function TestPrometheus:testGaugeDel()
   luaunit.assertEquals(self.dict:get('gauge2{f2="f2value",f1="f1value"}'), nil)
   luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 1)
 end
+function TestPrometheus:testGaugeSetAfterDel()
+  self.gauge2:set(1, {"a", "x"})
+  self.gauge2:del({"a", "x"})
+  self.gauge2:set(2, {"a", "x"})
+
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'gauge2{f2="a",f1="x"} 2\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+function TestPrometheus:testCounterSetAfterDel()
+  self.counter2:inc(1, {"a", "x"})
+  self.p._counter:sync()
+  self.counter2:del({"a", "x"})
+  self.counter2:inc(3, {"a", "x"})
+  self.p._counter:sync()
+
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'metric2{f2="a",f1="x"} 3\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+-- A second library instance on the same dict stands in for another worker.
+function TestPrometheus:testSeriesExportedAfterDelByAnotherWorker()
+  local p2 = require('prometheus').init('metrics')
+  local gauge2_p2 = p2:gauge("gauge2", "Gauge 2", {"f2", "f1"})
+
+  -- The label set goes A -> B -> A: this worker still holds the A series in
+  -- its lookup table when the other one retires it.
+  self.gauge2:set(1, {"a", "x"})
+  self.gauge2:set(5, {"a", "y"})
+  gauge2_p2:del({"a", "x"})
+  self.p.key_index:sync()
+  luaunit.assertEquals(self.gauge2.lookup, {})
+  luaunit.assertEquals(self.gauge2.lookup_size, 0)
+
+  self.gauge2:set(2, {"a", "x"})
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'gauge2{f2="a",f1="x"} 2\n')
+  luaunit.assertStrContains(out, 'gauge2{f2="a",f1="y"} 5\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+function TestPrometheus:testHistogramExportedAfterResetByAnotherWorker()
+  local p2 = require('prometheus').init('metrics')
+  local hist1_p2 = p2:histogram("l1", "Histogram 1")
+
+  self.hist1:observe(0.4)
+  self.p._counter:sync()
+  hist1_p2:reset()
+  self.p.key_index:sync()
+  luaunit.assertEquals(self.hist1.lookup, {})
+
+  self.hist1:observe(0.6)
+  self.p._counter:sync()
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'l1_count 1\n')
+  luaunit.assertStrContains(out, 'l1_sum 0.6\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+-- A metric with an exptime adds the series to the key index on every lookup,
+-- so its lookup table is kept.
+function TestPrometheus:testExptimeLookupKeptAfterDelByAnotherWorker()
+  local p2 = require('prometheus').init('metrics')
+  local gauge_exp_p2 = p2:gauge("gauge_exp", "Gauge expire", nil, 1)
+
+  self.gauge_exp:set(1)
+  gauge_exp_p2:del()
+  self.p.key_index:sync()
+  luaunit.assertNotEquals(self.gauge_exp.lookup, {})
+
+  self.gauge_exp:set(3)
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'gauge_exp 3\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+-- Every worker syncs the key index on a timer, so a deletion by another worker
+-- reaches its lookup tables without waiting for a scrape.
+function TestPrometheus:testKeyIndexSyncTimer()
+  local every = ngx.timer.every
+  local timers = {}
+  ngx.timer.every = function(delay, fn, context)
+    timers[#timers + 1] = {delay = delay, fn = fn, context = context}
+    return true
+  end
+  local p = require('prometheus').init('metrics', {sync_interval = 2})
+  ngx.timer.every = every
+
+  local sync_timer
+  for _, timer in ipairs(timers) do
+    if timer.context == p then
+      sync_timer = timer
+    end
+  end
+  luaunit.assertNotNil(sync_timer)
+  luaunit.assertEquals(sync_timer.delay, 2)
+
+  local gauge2 = p:gauge("gauge2", "Gauge 2", {"f2", "f1"})
+  gauge2:set(1, {"a", "x"})
+  self.gauge2:del({"a", "x"})
+
+  sync_timer.fn(true, sync_timer.context)
+  luaunit.assertNotEquals(gauge2.lookup, {})
+  sync_timer.fn(false, sync_timer.context)
+  luaunit.assertEquals(gauge2.lookup, {})
+
+  gauge2:set(2, {"a", "x"})
+  local out = table.concat(p:metric_data())
+  luaunit.assertStrContains(out, 'gauge2{f2="a",f1="x"} 2\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+function TestPrometheus.testKeyIndexSyncTimerFailure()
+  local every = ngx.timer.every
+  ngx.timer.every = function() return nil, "too many pending timers" end
+  require('prometheus').init('metrics')
+  ngx.timer.every = every
+
+  local logged = false
+  for _, log in ipairs(ngx.logs or {}) do
+    if log:find("failed to start the key index sync timer", 1, true) and
+       log:find("too many pending timers", 1, true) then
+      logged = true
+    end
+  end
+  luaunit.assertTrue(logged)
+end
 function TestPrometheus:testCounterDel()
   self.counter1:inc(1)
   self.p._counter:sync()
@@ -2245,6 +2368,26 @@ function TestKeyIndex:testSync()
   luaunit.assertEquals(#keys, 2)
   luaunit.assertEquals(keys[1], "key1")
   luaunit.assertEquals(keys[2], "key3")
+end
+
+-- The callback reports keys that another worker removed, not local removals.
+function TestKeyIndex:testDeleteCallback()
+  local deleted = {}
+  local key_index = require('prometheus_keys').new(self.dict, "_cb_", 1, nil,
+    function(key) deleted[#deleted + 1] = key end)
+  key_index:add({"key1", "key2", "key3"}, "eviction")
+
+  -- removed by another worker
+  self.dict:set("_cb_delete_count", 1)
+  self.dict:delete("_cb_key_2")
+  key_index:sync()
+  luaunit.assertEquals(deleted, {"key2"})
+
+  key_index:remove("key3", "eviction")
+  key_index:sync()
+  luaunit.assertEquals(deleted, {"key2"})
+  luaunit.assertEquals(key_index:list(), {"key1"})
+  luaunit.assertEquals(ngx.logs, nil)
 end
 
 function TestPrometheus:testLookupMaxSize()

@@ -64,10 +64,13 @@ end
 
 -- remove_expired_keys_interval: seconds between cleanup rounds; 0 or less
 -- starts no cleanup timer. auto_flush_expired: false leaves
--- dict:flush_expired() to the caller.
+-- dict:flush_expired() to the caller. delete_callback: called with the key
+-- when a sync finds its slot empty, which mostly means that another worker
+-- removed it.
 function KeyIndex.new(shared_dict, prefix, remove_expired_keys_interval,
-                      auto_flush_expired)
+                      auto_flush_expired, delete_callback)
   local self = setmetatable({}, KeyIndex)
+  self.delete_callback = delete_callback
   self.dict = shared_dict
   self.key_prefix = prefix .. "key_"
   self.delete_count = prefix .. "delete_count"
@@ -263,6 +266,9 @@ function KeyIndex:sync_range(first, last)
         end
       end
     elseif self.keys[i] then
+      if self.delete_callback then
+        self.delete_callback(self.keys[i])
+      end
       self:forget_slot(i)
     end
   end
