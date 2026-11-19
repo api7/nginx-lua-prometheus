@@ -387,8 +387,7 @@ local function lookup_or_create(self, label_values)
   end
 
   if self.lookup_size >= self.lookup_max_size then
-    self.lookup_size = 0
-    self.lookup = {}
+    self:reset_lookup()
   end
 
   local t = self.lookup
@@ -562,8 +561,7 @@ local function del(self, label_values)
 
   -- Clean up the full metric name lookup table as well, so that the series
   -- is added back to the key index when it is used again.
-  self.lookup = {}
-  self.lookup_size = 0
+  self:reset_lookup()
 end
 
 -- Set the value of a gauge metric.
@@ -708,6 +706,12 @@ local function reset(self)
   end
 
   -- Clean up the full metric name lookup table as well.
+  self:reset_lookup()
+end
+
+-- Reset the metric name lookup table for a given metric.
+local function reset_lookup(self)
+  self.lookup_size = 0
   self.lookup = {}
 end
 
@@ -763,7 +767,24 @@ function Prometheus.init(dict_name, options_or_prefix)
 
   self.registry = {}
   self.key_index = key_index_lib.new(self.dict, KEY_INDEX_PREFIX,
-    self.remove_expired_keys_interval, self.auto_flush_expired)
+    self.remove_expired_keys_interval, self.auto_flush_expired,
+    function(metric_key)
+      -- When another worker calls reset or del on a metric, reset that
+      -- metric's local lookup table, so that the series is added back to the
+      -- key index when it is used again. A metric with an exptime adds the
+      -- series on every lookup anyway.
+      local metric_name = ngx_re_gsub(metric_key, "{.*", "", "jo")
+      local m = self.registry[metric_name]
+      if not m then
+        m = self.registry[ngx_re_gsub(metric_name, "_sum$", "", "jo")]
+        if not m or m.typ ~= TYPE_HISTOGRAM then
+          return
+        end
+      end
+      if not m.exptime or m.exptime <= 0 then
+        m:reset_lookup()
+      end
+    end)
 
   self.initialized = true
 
@@ -778,6 +799,12 @@ function Prometheus.init(dict_name, options_or_prefix)
     self:init_worker(self.sync_interval)
   end
   return self
+end
+
+local function sync_key_index(premature, self)
+  if not premature then
+    self.key_index:sync()
+  end
 end
 
 -- Initialize the worker counter.
@@ -807,6 +834,13 @@ function Prometheus:init_worker(sync_interval)
     error(err, 2)
   end
   self._counter = counter_instance
+
+  -- Sync the key index on every worker, so that deletions by other workers
+  -- reach the local lookup tables (see the delete callback in init()).
+  local ok, timer_err = ngx.timer.every(self.sync_interval, sync_key_index, self)
+  if not ok then
+    ngx.log(ngx.ERR, "failed to start the key index sync timer: ", timer_err)
+  end
 end
 
 -- Register a new metric.
@@ -869,6 +903,7 @@ local function register(self, name, help, label_names, buckets, typ, exptime)
     lookup = {},
     lookup_size = 0,
     lookup_max_size = self.lookup_max_size,
+    reset_lookup = reset_lookup,
     parent = self,
     -- Store a reference for logging functions for faster lookup.
     _log_error = function(...) self:log_error(...) end,
