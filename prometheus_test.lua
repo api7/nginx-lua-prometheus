@@ -581,6 +581,26 @@ function TestPrometheus:testGaugeDel()
   luaunit.assertEquals(self.dict:get('gauge2{f2="f2value",f1="f1value"}'), nil)
   luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 1)
 end
+function TestPrometheus:testGaugeSetAfterDel()
+  self.gauge2:set(1, {"a", "x"})
+  self.gauge2:del({"a", "x"})
+  self.gauge2:set(2, {"a", "x"})
+
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'gauge2{f2="a",f1="x"} 2\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
+function TestPrometheus:testCounterSetAfterDel()
+  self.counter2:inc(1, {"a", "x"})
+  self.p._counter:sync()
+  self.counter2:del({"a", "x"})
+  self.counter2:inc(3, {"a", "x"})
+  self.p._counter:sync()
+
+  local out = table.concat(self.p:metric_data())
+  luaunit.assertStrContains(out, 'metric2{f2="a",f1="x"} 3\n')
+  luaunit.assertEquals(self.dict:get("nginx_metric_errors_total"), 0)
+end
 function TestPrometheus:testCounterDel()
   self.counter1:inc(1)
   self.p._counter:sync()
