@@ -87,4 +87,13 @@ peer_removable:del()
 target:set(42)
 assert(table.concat(peer:metric_data()):find("\ntarget 42\n", 1, true),
        "public API omitted the returning metric")
+
+-- Reader and writer can register different metric families in the same dict.
+local owned = p:gauge("writer_only", "Writer-only metric", {"instance_id"})
+owned:set(11, {"old"})
+owned:set(22, {"new"})
+local data = table.concat(peer:metric_data({label_filter = {name = "instance_id", value = "new"}}))
+assert(data:find('writer_only{instance_id="new"} 22\n', 1, true))
+assert(not data:find('writer_only{instance_id="old"}', 1, true))
+assert(data:find("\ntail 1\n", 1, true))
 ngx.say("ok")

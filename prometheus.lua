@@ -958,6 +958,55 @@ local function error_metric_full_name(name, labels)
   return full_metric_name(name, names, values)
 end
 
+local function compile_label_filter(filter)
+  if type(filter) ~= "table" or type(filter.name) ~= "string" then
+    return nil, "label_filter must specify a label name"
+  end
+  local value_type = type(filter.value)
+  if value_type ~= "string" and value_type ~= "number" and value_type ~= "boolean" then
+    return nil, "label_filter value must be a string, number, or boolean"
+  end
+  local err = check_metric_and_label_names("label_filter", {filter.name})
+  if err then
+    return nil, err
+  end
+  local label = filter.name .. '="'
+  return {
+    name = filter.name,
+    first = "{" .. label,
+    next = "," .. label,
+    expected = full_metric_name("", {filter.name}, {filter.value}):sub(2, -2),
+  }
+end
+
+local function matches_label_filter(key, filter)
+  if not key:find(filter.first, 1, true) and not key:find(filter.next, 1, true) then
+    return true
+  end
+
+  -- A candidate can occur at the end of another label value. Walk fields from
+  -- the opening brace and skip escaped characters inside quoted values.
+  local start = key:find("{", 1, true) + 1
+  while true do
+    local value_open = key:find('="', start, true)
+    if not value_open then
+      return true
+    end
+    if key:sub(start, value_open - 1) == filter.name then
+      return key:sub(start, start + #filter.expected - 1) == filter.expected
+    end
+
+    local close = key:find('["\\]', value_open + 2)
+    while close and key:sub(close, close) == "\\" do
+      close = key:find('["\\]', close + 2)
+    end
+    if not close or key:sub(close + 1, close + 1) ~= "," then
+      return true
+    end
+    start = close + 2
+  end
+end
+
 -- Prometheus compatible metric data as an array of strings.
 --
 -- Returns:
@@ -979,6 +1028,14 @@ function Prometheus:metric_data(options)
       error_name = name
     end
   end
+  local label_filter
+  if type(options) == "table" and options.label_filter ~= nil then
+    local err
+    label_filter, err = compile_label_filter(options.label_filter)
+    if err then
+      self:log_error(err)
+    end
+  end
 
   -- Force a manual sync of counter local state (mostly to make tests work).
   self._counter:sync()
@@ -993,7 +1050,11 @@ function Prometheus:metric_data(options)
   for _, key in ipairs(keys) do
     yield()
 
-    local value, err = self.dict:get(key)
+    local value, err
+    if not label_filter or matches_label_filter(
+        key == self.error_metric_name and error_name or key, label_filter) then
+      value, err = self.dict:get(key)
+    end
     if value then
       local short_name = short_metric_name(key)
       if not seen_metrics[short_name] then

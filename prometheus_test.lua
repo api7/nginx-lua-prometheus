@@ -289,6 +289,65 @@ function TestPrometheus:testInvalidErrorMetricLabels()
   end
 end
 
+function TestPrometheus:testMetricDataLabelFilter()
+  local p = self.p
+  local requests = p:gauge("requests", "Requests", {"route", "instance_id"})
+  local duration = p:histogram("duration", "Duration", {"instance_id"}, {0.1, 1})
+  local other = p:gauge("other", "Other", {"remote_instance_id", "route"})
+  p:gauge("unlabelled", "Unlabelled"):set(5)
+  p:gauge("retired", "Retired", {"instance_id"}):set(6, {"old"})
+
+  local current = 'new"\\\n'
+  requests:set(1, {"a", current})
+  requests:set(2, {"a", current .. "suffix"})
+  requests:set(3, {"a", "old"})
+  duration:observe(0.5, {current})
+  duration:observe(0.7, {"old"})
+  other:set(4, {"old", 'request{instance_id="old",instance_id="old"'})
+  p:log_error("test")
+
+  local options = {
+    label_filter = {name = "instance_id", value = current},
+    error_metric_labels = {instance_id = current},
+  }
+  local output = table.concat(p:metric_data(options))
+  local expected_label = 'instance_id="new\\"\\\\\\n"'
+  luaunit.assertStrContains(output, 'requests{route="a",' .. expected_label .. '} 1\n')
+  luaunit.assertStrContains(output, '# TYPE duration histogram\n')
+  luaunit.assertStrContains(output, 'duration_bucket{' .. expected_label .. ',le="+Inf"} 1\n')
+  luaunit.assertStrContains(output, 'duration_count{' .. expected_label .. '} 1\n')
+  luaunit.assertStrContains(output, 'duration_sum{' .. expected_label .. '} 0.5\n')
+  luaunit.assertNotStrContains(output, 'duration_bucket{instance_id="old"')
+  luaunit.assertNotStrContains(output, 'duration_count{instance_id="old"')
+  luaunit.assertNotStrContains(output, 'duration_sum{instance_id="old"')
+  luaunit.assertNotStrContains(output, 'suffix')
+  luaunit.assertNotStrContains(output, 'retired')
+  luaunit.assertStrContains(output, 'other{remote_instance_id="old",route=')
+  luaunit.assertStrContains(output, '\nunlabelled 5\n')
+  luaunit.assertStrContains(output, 'nginx_metric_errors_total{' .. expected_label .. '} 1\n')
+
+  options.label_filter.value = "old"
+  output = table.concat(p:metric_data(options))
+  luaunit.assertStrContains(output, 'requests{route="a",instance_id="old"} 3\n')
+  luaunit.assertNotStrContains(output, expected_label)
+  luaunit.assertNotStrContains(output, 'nginx_metric_errors_total')
+  luaunit.assertStrContains(table.concat(p:metric_data()), 'retired{instance_id="old"} 6\n')
+end
+
+function TestPrometheus:testMetricDataLabelFilterUsesFieldBoundaries()
+  local p = self.p
+  p:gauge("without_instance", "Without instance", {"route"}):set(3, {"books,instance_id="})
+  local gauge = p:gauge("with_instance", "With instance", {"route", "instance_id"})
+  local route = 'books"\\,instance_id='
+  gauge:set(5, {route, "local"})
+  gauge:set(7, {route, "remote"})
+
+  local output = table.concat(p:metric_data({label_filter = {name = "instance_id", value = "local"}}))
+  luaunit.assertStrContains(output, 'without_instance{route="books,instance_id="} 3\n')
+  luaunit.assertStrContains(output, ',instance_id="local"} 5\n')
+  luaunit.assertNotStrContains(output, ',instance_id="remote"}')
+end
+
 function TestPrometheus:testInitWorker()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
