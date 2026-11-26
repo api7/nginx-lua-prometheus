@@ -972,6 +972,7 @@ local function compile_label_filter(filter)
   end
   local label = filter.name .. '="'
   return {
+    name = filter.name,
     first = "{" .. label,
     next = "," .. label,
     expected = full_metric_name("", {filter.name}, {filter.value}):sub(2, -2),
@@ -979,10 +980,31 @@ local function compile_label_filter(filter)
 end
 
 local function matches_label_filter(key, filter)
-  -- The unescaped quote after '=' occurs only at a label boundary. The same
-  -- text inside a label value has an escaped quote.
-  local at = key:find(filter.first, 1, true) or key:find(filter.next, 1, true)
-  return not at or key:sub(at + 1, at + #filter.expected) == filter.expected
+  if not key:find(filter.first, 1, true) and not key:find(filter.next, 1, true) then
+    return true
+  end
+
+  -- A candidate can occur at the end of another label value. Walk fields from
+  -- the opening brace and skip escaped characters inside quoted values.
+  local start = key:find("{", 1, true) + 1
+  while true do
+    local value_open = key:find('="', start, true)
+    if not value_open then
+      return true
+    end
+    if key:sub(start, value_open - 1) == filter.name then
+      return key:sub(start, start + #filter.expected - 1) == filter.expected
+    end
+
+    local close = key:find('["\\]', value_open + 2)
+    while close and key:sub(close, close) == "\\" do
+      close = key:find('["\\]', close + 2)
+    end
+    if not close or key:sub(close + 1, close + 1) ~= "," then
+      return true
+    end
+    start = close + 2
+  end
 end
 
 -- Prometheus compatible metric data as an array of strings.

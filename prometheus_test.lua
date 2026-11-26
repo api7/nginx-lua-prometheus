@@ -334,6 +334,20 @@ function TestPrometheus:testMetricDataLabelFilter()
   luaunit.assertStrContains(table.concat(p:metric_data()), 'retired{instance_id="old"} 6\n')
 end
 
+function TestPrometheus:testMetricDataLabelFilterUsesFieldBoundaries()
+  local p = self.p
+  p:gauge("without_instance", "Without instance", {"route"}):set(3, {"books,instance_id="})
+  local gauge = p:gauge("with_instance", "With instance", {"route", "instance_id"})
+  local route = 'books"\\,instance_id='
+  gauge:set(5, {route, "local"})
+  gauge:set(7, {route, "remote"})
+
+  local output = table.concat(p:metric_data({label_filter = {name = "instance_id", value = "local"}}))
+  luaunit.assertStrContains(output, 'without_instance{route="books,instance_id="} 3\n')
+  luaunit.assertStrContains(output, ',instance_id="local"} 5\n')
+  luaunit.assertNotStrContains(output, ',instance_id="remote"}')
+end
+
 function TestPrometheus:testInitWorker()
   self.dict = setmetatable({}, SimpleDict)
   ngx.shared.metrics = self.dict
