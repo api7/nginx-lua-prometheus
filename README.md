@@ -271,6 +271,13 @@ metric on this call. An omitted or empty map emits the bare error metric. An
 invalid label map is logged and counted as an error, and the bare error metric is
 emitted.
 
+The optional `options.label_filter = {name = "instance_id", value = "local-id"}`
+keeps samples that have the given label value or do not have that label. The
+value can be a string, number, or boolean. This filters the output for this
+call, including labels supplied by `error_metric_labels`, without changing
+stored samples. An invalid filter is logged and counted as an error, and the
+output is left unfiltered.
+
 ### counter:inc()
 
 **syntax:** counter:inc(*value*, *label_values*)
